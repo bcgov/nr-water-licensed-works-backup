@@ -1,0 +1,22 @@
+# Keep this list short. Anything added needs a reason.
+#
+# Versions are pinned. These jobs run unattended on a schedule, and an
+# unpinned dependency means a run that worked on Friday can fail on Monday
+# for reasons unrelated to this code - which surfaces as SYSTEM_FAIL and
+# wastes an investigation. Bump deliberately, and re-run the tests.
+#
+# Only the direct dependencies are pinned, not the ~70 packages arcgis
+# pulls in transitively. Pinning those too would need a lock file, which is
+# more machinery than this project warrants.
+#
+# jenkins/notify.py deliberately uses only boto3 and the standard library,
+# because the GIS server it runs on has limited Python environments. It
+# installs from jenkins/requirements.txt, not this file, so that arcgis is
+# never installed on that server.
+
+arcgis==2.4.3
+boto3==1.43.71
+PyYAML==6.0.3
+
+# Testing only
+pytest==9.1.1

@@ -1,0 +1,29 @@
+# Working documents - design and implementation notes, not part of the codebase
+spec/
+
+# Secrets - should never exist here, but belt and braces
+.env
+*.pem
+credentials*
+*secret*
+
+# Backup artifacts, if anything is run locally
+*.gdb
+*.gdb.zip
+tmp/
+downloads/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,312 @@
+# Water Licensed Works - backup and integrity checks
+#
+# Settings only. Secrets come from environment variables:
+#   AGO_USERNAME_WINS, AGO_PASSWORD_WINS
+#   S3_NRS_ENDPOINT, S3_GSS_GEODRIVE_KEY_ID, S3_GSS_GEODRIVE_SECRET_KEY
+#
+# Never put credentials in this file.
+
+
+# Everything is stored and compared in UTC. This zone is used only where a
+# local calendar boundary decides an outcome: which month a backup counts
+# towards for promotion, the date stamp on a prefix, and the expected-slot
+# arithmetic in the notify job.
+timezone: America/Vancouver
+
+
+agol:
+  url: https://governmentofbc.maps.arcgis.com
+
+
+# The two hosted feature layers being protected.
+# Note the field lists differ - points has no DISPLAY_COLOUR.
+layers:
+
+  lines:
+    item_id: a938dd3fcafa4b98baee3fcb5ab59fe8
+    layer_index: 0
+    name: WATER_LICENSED_WORKS_LINES
+    geometry: polyline
+    # Shape__Length exists on lines only, so the total-length metric
+    # is collected for this layer and skipped for points.
+    has_length_field: true
+    null_check_fields:
+      - TWRK_TAG
+      - FEATURE_CODE
+    distinct_value_field: FEATURE_CODE
+
+  points:
+    item_id: 848f3c3900da4b1b907a415154a53042
+    layer_index: 0
+    name: WATER_LICENSED_WORKS_POINTS
+    geometry: point
+    has_length_field: false
+    null_check_fields:
+      - TWRK_TAG
+      - FEATURE_CODE
+    distinct_value_field: FEATURE_CODE
+
+
+storage:
+  bucket: gssgeodrive
+  # The bucket is shared with other GSS
+  # projects, so everything this project reads, writes, lists or deletes
+  # lives under this prefix and nothing may construct a key outside it.
+  prefix: authorizations/backups/water_licensed_works/
+
+  # Sub-prefixes, appended to the above.
+  paths:
+    rotating: rotating/
+    monthly: monthly/
+    yearly: yearly/
+    metrics: metrics/
+    status: status/
+
+
+backup:
+  # item.export() is asynchronous - it queues a job on AGOL and returns.
+  # Poll until the export item is ready, then give up rather than hanging
+  # a scheduled run indefinitely. A timeout is SYSTEM_FAIL, not DATA_FAIL.
+  # PLACEHOLDER values: replace once the spike measures a real export.
+  export_timeout_minutes: 30
+  export_poll_seconds: 15
+
+  # Artifact validation, run before anything is uploaded. DESIGN.md 6.5.
+  # This proves the downloaded file is intact. It does NOT prove the data
+  # inside it is good - that is the check job's role, and the reason
+  # promotion additionally requires a PASS.
+  validation:
+    require_nonzero: true
+    # The count inside the exported FGDB is compared against a live count
+    # taken at export time. A small difference is legitimate - an edit can
+    # land while the export is running. A large one means the artifact is
+    # not a faithful snapshot and the run fails.
+    count_tolerance_percent: 1   # PLACEHOLDER
+
+
+retention:
+  # Mon/Wed/Fri snapshots. Raised above the 3 in the client's document
+  # because 3 sets do not survive a week of no response: a Tuesday
+  # incident leaves every rotating copy bad by the following Monday.
+  # At roughly 8 MB per set the cost of a longer window is nil.
+  rotating_sets: 8
+
+  # Promoted from the first rotating set of the month whose paired
+  # check status was PASS. See the promotion section below.
+  monthly_sets: 12
+
+  # Promoted from the first monthly set of the year. Never pruned.
+  yearly_sets: null
+
+  # Metrics files are a few KB each, so history is cheap and useful.
+  metrics_days: 400
+
+  # Pruning is paused while the most recent check status is DATA_FAIL,
+  # so a live incident cannot quietly evict the last good copy while
+  # nobody is acting on the alert.
+  pause_prune_on_data_fail: true
+  # Hard ceiling so a long-unresolved failure cannot grow without limit.
+  rotating_sets_max: 20
+  # Escalate if pruning has been paused this long.
+  paused_prune_alert_days: 7
+
+
+promotion:
+  # A set is eligible for promotion to the monthly tier only if its
+  # paired check status was PASS. Artifact validation (zip opens,
+  # counts sane) proves the file is intact, NOT that the data is good -
+  # a faithful snapshot of corrupt data passes artifact validation.
+  # Without this rule a corrupt set can become the monthly anchor that
+  # the trend comparison is measured against for the rest of the month.
+  require_check_pass: true
+  # If no set has passed yet, promotion retries on the next backup run.
+  # Alert if the month is this far in with nothing promoted.
+  no_candidate_alert_days: 10
+
+
+schedule:
+  # Used by the Jenkins notify job to decide whether a run is overdue.
+  # These must match the cron expressions in .github/workflows/.
+  backup_days: [monday, wednesday, friday]
+  checks_daily: true
+
+  # Staleness is measured from the EXPECTED SLOT, not as hours since
+  # the last run. Measuring hours-since would false-alarm every weekend,
+  # because the Friday-to-Monday backup gap is 72 hours by design.
+  # Rule: once an expected slot has passed, allow this much grace before
+  # treating a missing result as a failure.
+  checks_grace_hours: 2
+  backup_grace_hours: 6
+
+
+checks:
+  # Geohash precision for the spatial bin distribution check.
+  # Lower is coarser. 4 gives roughly 40 km cells, which suits a
+  # province-wide dataset. Tune during the baseline period.
+  geohash_precision: 4
+
+  # Rolling comparisons, in addition to the previous-day comparison.
+  trend_window_days: 30
+  use_monthly_anchor: true
+
+  # How extent drift is measured: the largest displacement of any of the
+  # four bounding box corners, in metres, against the comparison run.
+  # Chosen over area or diagonal change because it catches both a
+  # translated extent and an expanded one, and is easy to reason about
+  # when reading an alert.
+  extent_drift_method: max_corner_displacement
+
+
+# ---------------------------------------------------------------------------
+# THRESHOLDS - PER LAYER
+#
+# Every value below except the schema rule is a PLACEHOLDER.
+# They are replaced with values derived from the 4-6 week baseline period.
+# Do not treat these as tuned. See DESIGN.md section 7.4.
+#
+# Thresholds are per-layer because the layers behave differently: lines
+# has a total_length metric that points does not, and edit volumes and
+# volatility will diverge once baselined.
+#
+# fail_when: both  -> percent AND absolute must both be exceeded
+# fail_when: any   -> either one is enough
+#
+# Only FAIL gates the nightly push in Phase 2. WARN alerts and is recorded.
+# ---------------------------------------------------------------------------
+thresholds:
+
+  lines:
+    feature_count:
+      decrease:
+        fail_when: both      # PLACEHOLDER
+        percent: 10          # PLACEHOLDER
+        absolute: 100        # PLACEHOLDER
+        severity: FAIL
+      increase:
+        fail_when: any       # PLACEHOLDER
+        percent: 25          # PLACEHOLDER
+        severity: WARN
+    zero_features:
+      severity: FAIL
+    spatial_bins:
+      bin_disappeared:
+        severity: FAIL
+      bin_count_change:
+        percent: 20          # PLACEHOLDER
+        severity: WARN
+    extent:
+      drift_metres: 5000     # PLACEHOLDER
+      severity: WARN
+    total_length:
+      change_percent: 10     # PLACEHOLDER
+      severity: WARN
+    schema:
+      # Not a placeholder. Any schema change should be looked at.
+      # Covers field names and types, domain coded values, and subtypes.
+      rule: exact_match
+      severity: FAIL
+    null_rate:
+      increase_percent: 5    # PLACEHOLDER
+      severity: WARN
+    distinct_values:
+      unexpected_value:
+        severity: FAIL
+
+  points:
+    feature_count:
+      decrease:
+        fail_when: both      # PLACEHOLDER
+        percent: 10          # PLACEHOLDER
+        absolute: 250        # PLACEHOLDER - larger layer, ~54k features
+        severity: FAIL
+      increase:
+        fail_when: any       # PLACEHOLDER
+        percent: 25          # PLACEHOLDER
+        severity: WARN
+    zero_features:
+      severity: FAIL
+    spatial_bins:
+      bin_disappeared:
+        severity: FAIL
+      bin_count_change:
+        percent: 20          # PLACEHOLDER
+        severity: WARN
+    extent:
+      # Weak signal on this layer until the two known outlier records
+      # (OBJECTID 150984, 150985) are corrected. See DESIGN.md section 4.
+      drift_metres: 5000     # PLACEHOLDER
+      severity: WARN
+    schema:
+      rule: exact_match
+      severity: FAIL
+    null_rate:
+      increase_percent: 5    # PLACEHOLDER
+      severity: WARN
+    distinct_values:
+      unexpected_value:
+        severity: FAIL
+
+
+# Temporarily suppress rules for a known, approved change - a planned bulk
+# edit or schema update. Suppressions are logged, and both dates are
+# required so a suppression cannot be open-ended in either direction.
+# Leave empty in normal operation.
+suppressions: []
+# Example:
+#   - rule: feature_count
+#     layer: points
+#     from: 2026-09-14
+#     until: 2026-09-30
+#     reason: "Bulk load of 2026 licence works approved by data owner"
+
+
+# ---------------------------------------------------------------------------
+# NOTIFICATIONS
+#
+# Read by jenkins/notify.py on the GIS server. Nothing here is read by the
+# GitHub Actions jobs - they only write status objects.
+#
+# Recipient addresses are NOT committed. Each role below names the
+# environment variable that holds its address list (comma separated) on the
+# Jenkins host. The routing itself lives here because it is policy rather
+# than a secret, and a single ALERT_RECIPIENTS variable cannot express
+# per-outcome routing.
+# ---------------------------------------------------------------------------
+notifications:
+
+  roles:
+    data_owner: ALERT_DATA_OWNER
+    shared_inbox: ALERT_SHARED_INBOX
+    developer: ALERT_DEVELOPER
+
+  # The relay is reachable from the GIS server only, never from a GitHub
+  # runner. Set on the Jenkins host: SMTP_SERVER, SMTP_SENDER.
+
+  # DESIGN.md section 8.4. An empty list means no mail is sent.
+  # Sending routine noise to the shared inbox is the fastest way to have
+  # the whole channel rule-filtered into a folder, at which point a real
+  # DATA_FAIL goes unread. That is why only DATA_FAIL reaches the client.
+  routing:
+    PASS: []
+    BASELINE: [developer]
+    WARN: [developer]
+    DATA_FAIL: [data_owner, shared_inbox, developer]
+    SYSTEM_FAIL: [developer]
+    stale: [developer]
+    prune_paused: [developer]
+    weekly_summary: [data_owner, shared_inbox, developer]
+
+  # A SYSTEM_FAIL lasting this long means backups are not running, which
+  # is the data owner's problem as well as ours.
+  system_fail_escalation_days: 3
+  system_fail_escalation_adds: [data_owner, shared_inbox]
+
+  # Reassurance that the control is alive. Not a failure-detection
+  # mechanism - staleness detection does that. DESIGN.md section 8.2.
+  weekly_summary:
+    day: monday
+    hour_local: 8
+
+
+logging:
+  level: INFO
