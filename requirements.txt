@@ -18,5 +18,13 @@ arcgis==2.4.3
 boto3==1.43.71
 PyYAML==6.0.3
 
+# Reads the feature count out of the exported File Geodatabase, which is how
+# backup.py proves the artifact is a faithful snapshot rather than merely an
+# intact zip (DESIGN.md 6.5 step 2). arcpy is not available on a GitHub
+# runner and nothing else in the dependency set can open an FGDB. pyogrio
+# ships GDAL wheels, so this needs no system GDAL install; only backup.py
+# imports it, and checks.py must never do so.
+pyogrio==0.13.0
+
 # Testing only
 pytest==9.1.1
