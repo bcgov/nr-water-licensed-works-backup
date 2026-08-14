@@ -211,6 +211,41 @@ def download_file(storage, key, local_path):
     return local_path
 
 
+def read_bytes(storage, key):
+    """Fetch one object into memory and return its bytes.
+
+    For the small JSON objects the pipeline reads back - status objects,
+    manifests - where writing them to a temporary file first would be
+    ceremony. Never use it for an artifact: download_file streams to disk
+    instead of holding the whole geodatabase in memory.
+    """
+    source = full_key(storage, key)
+    return storage.client.get_object(Bucket=storage.bucket, Key=source)["Body"].read()
+
+
+def copy_key(storage, source_key, destination_key):
+    """Copy an object within the project prefix, server side.
+
+    This is how a rotating set becomes a monthly or yearly one (DESIGN.md
+    6.4). Promotion copies an artifact that has already been validated and
+    checked rather than exporting again: a second export would produce a
+    different snapshot taken at a different moment, and would add two
+    low-frequency scheduled jobs that could fail unnoticed.
+
+    Both keys go through full_key, so a copy cannot reach outside the project
+    prefix at either end.
+    """
+    source = full_key(storage, source_key)
+    destination = full_key(storage, destination_key)
+    storage.client.copy_object(
+        Bucket=storage.bucket,
+        Key=destination,
+        CopySource={"Bucket": storage.bucket, "Key": source},
+    )
+    logger.info("Copied %s to %s", source_key, destination_key)
+    return destination
+
+
 def key_exists(storage, key):
     """Is there an object at this key? A head request, so nothing is downloaded."""
     try:
