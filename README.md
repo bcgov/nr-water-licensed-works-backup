@@ -49,6 +49,7 @@ storage.py            object storage wrapper
 status.py             writes the run status object
 run_backup.py         entry point
 run_checks.py         entry point
+preflight.py          read-only environment and assumption check
 jenkins/              notification job; boto3 and standard library only
 tests/                known-answer tests for the check rules
 docs/                 restore runbooks and guides

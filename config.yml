@@ -67,9 +67,21 @@ backup:
   # item.export() is asynchronous - it queues a job on AGOL and returns.
   # Poll until the export item is ready, then give up rather than hanging
   # a scheduled run indefinitely. A timeout is SYSTEM_FAIL, not DATA_FAIL.
-  # PLACEHOLDER values: replace once the spike measures a real export.
-  export_timeout_minutes: 30
-  export_poll_seconds: 15
+  #
+  # Measured, not guessed. Two real exports on 2026-08-14:
+  #   points  53,987 features,  7.2 MB service -> 54.5 min, 3.0 MB zip
+  #   lines  142,523 features, 39.3 MB service -> 22.6 min, 14.5 MB zip
+  #
+  # The larger layer was the faster one, so the wait is AGOL queue time and
+  # not data volume. That means the spread is the thing to size for, not the
+  # average: 90 minutes is a little under twice the worst run observed.
+  # Raise it if a real run ever times out - a slow export is not a fault,
+  # and failing a backup that would have succeeded is the worse outcome.
+  export_timeout_minutes: 90
+
+  # At tens of minutes per export, polling every 15 seconds was hundreds of
+  # pointless calls per run.
+  export_poll_seconds: 60
 
   # Artifact validation, run before anything is uploaded. DESIGN.md 6.5.
   # This proves the downloaded file is intact. It does NOT prove the data
@@ -140,10 +152,43 @@ schedule:
 
 
 checks:
-  # Geohash precision for the spatial bin distribution check.
-  # Lower is coarser. 4 gives roughly 40 km cells, which suits a
-  # province-wide dataset. Tune during the baseline period.
-  geohash_precision: 4
+  # Spatial bin distribution - the check that catches a localized deletion
+  # that feature count and extent both miss. DESIGN.md 7.2.1 and 7.2.2.
+  #
+  # Geohash binning was the original plan. It does not exist on these
+  # services: queryBins bins on numeric and date fields only, and although
+  # the layers advertise supportsLod with supportedLodTypes ['geohash'] they
+  # carry no lodInfos and reject every lod value. So the grid is ours - a
+  # fixed lattice of square cells over BC in BC Albers metres, with one
+  # returnCountOnly query per cell. Measured at 5.6 minutes for both layers.
+  #
+  # DO NOT CHANGE THESE VALUES TO TUNE THE CHECK.
+  #
+  # Bin counts are only comparable against bins of the same size in the same
+  # place. Changing the cell size or the origin silently invalidates every
+  # stored metrics file and restarts the 4-6 week baseline period. This is
+  # structural, not a threshold. Cell size can be aggregated upwards after
+  # the fact (four 50 km cells sum to one 100 km cell) but never split
+  # downwards, which is why 50 km is the stored resolution.
+  spatial_grid:
+    # Anchored to a fixed envelope, deliberately NOT derived from the live
+    # data extent: the two bad point records (DESIGN.md 4) put the points
+    # extent 4,000 km west, which would generate a grid over the Pacific.
+    xmin: 200000
+    ymin: 300000
+    xmax: 1900000
+    ymax: 1800000
+    cell_size_metres: 50000
+    wkid: 3005
+
+    # Known-answer guard, run every pass. The cell counts must add back up
+    # to the live feature count. Points partition the grid exactly, less
+    # anything outside it; a polyline crossing a cell boundary is counted in
+    # both cells, so lines run slightly over - measured at 0.51% over at
+    # this cell size. A discrepancy beyond this means the geometry filter is
+    # malformed and no number from the pass can be trusted. Fail the run
+    # rather than record it. DESIGN.md 12 explains why this matters.
+    max_sum_overcount_percent: 2
 
   # Rolling comparisons, in addition to the previous-day comparison.
   trend_window_days: 30
