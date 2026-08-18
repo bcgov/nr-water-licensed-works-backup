@@ -1,0 +1,196 @@
+// Water Licensed Works - hourly notification job.
+//
+// Reads the status objects the GitHub Actions backup and check jobs wrote to
+// object storage, and sends alert mail through the internal SMTP relay. It is
+// on this server because a GitHub-hosted runner cannot reach the relay and
+// this one can - that is the whole of the hybrid design (DESIGN.md 8.1).
+//
+// This job READS object storage and writes nothing to it. It cannot be
+// restricted to that, because the bucket issues a single full-access key pair
+// (DESIGN.md 6.6), so it is a convention held in notify.py and asserted by
+// tests/test_notify.py rather than a permission boundary.
+//
+// It touches no ArcGIS Online layer, holds no AGOL credentials, and has no
+// restore path. Recovery is a manual decision made by the data owner.
+
+pipeline {
+    agent any
+
+    options {
+        // Hourly polling fills a build list quickly. Fifty builds is a little
+        // over two days, which is enough to see what happened around an alert
+        // without keeping a month of "nothing to do". DESIGN.md 9.1.
+        buildDiscarder(logRotator(numToKeepStr: '50'))
+        // A poll is seconds. Anything past this is an unreachable relay or a
+        // hung connection, and it must not still be running when the next
+        // hour's build starts.
+        timeout(time: 15, unit: 'MINUTES')
+        disableConcurrentBuilds()
+    }
+
+    triggers {
+        // Hourly, at a stable but arbitrary minute rather than on the hour.
+        // 'H' spreads the load instead of joining every other hourly job on
+        // this server at the top of the hour.
+        //
+        // Hourly does NOT mean hourly email. The check job writes one status
+        // object a day and notify.py mails only on a change of situation, so
+        // a failure lasting five days is two emails whatever the poll
+        // frequency (DESIGN.md 8.5). What the frequency buys is latency, and
+        // it is what makes schedule.checks_grace_hours of 2 enforceable at
+        // all - a job that looked once a day could not detect a two-hour
+        // delay. Do not slow this down without raising the grace periods to
+        // match.
+        cron('H * * * *')
+    }
+
+    environment {
+        // The deduplication state, and the one thing on this host that must
+        // survive a build. It is deliberately NOT in the workspace: a wiped
+        // or fresh workspace looks exactly like a notifier that has never
+        // sent anything, so every open alert would be sent again. JENKINS_HOME
+        // survives a workspace wipe, is writable by the Jenkins user, and is
+        // covered by whatever backs this server up. DESIGN.md 8.5.
+        NOTIFY_STATE_FILE = "${JENKINS_HOME}/water-licensed-works/notify-state.json"
+
+        // Which Python runs the job. Set NOTIFY_PYTHON as a global environment
+        // variable on this Jenkins instance to the full path of the interpreter
+        // - on the GIS server that is a clone of the ArcGIS Pro conda
+        // environment with boto3, PyYAML and tzdata already in it. It falls
+        // back to whatever 'python' is on the PATH, which is right for a
+        // developer machine and almost certainly wrong on a server where the
+        // PATH resolves to the stock Pro environment.
+        //
+        // The path lives on the host rather than here because this is a public
+        // repository and internal server layout does not belong in it.
+        //
+        // Calling the interpreter by full path rather than activating the conda
+        // environment is deliberate and safe for this job: boto3, PyYAML and
+        // tzdata are pure Python and need no activation. It would NOT be safe
+        // for anything importing arcpy, which needs the environment activated
+        // for its DLL search path - and nothing here imports arcpy.
+        PYTHON = "${env.NOTIFY_PYTHON ?: 'python'}"
+
+        // Empty in normal operation. Set NOTIFY_DRY_RUN to 'true' on this
+        // Jenkins instance for the testing period and every build reports what
+        // it would send without sending it.
+        NOTIFY_ARGS = "${env.NOTIFY_DRY_RUN == 'true' ? '--dry-run' : ''}"
+    }
+
+    // SMTP_HOST, SMTP_SENDER, ALERT_DATA_OWNER, ALERT_SHARED_INBOX and
+    // ALERT_DEVELOPER are set as global environment variables on this Jenkins
+    // instance (Manage Jenkins > System > Global properties) and are inherited
+    // by every step below. They are deliberately NOT redeclared here: naming
+    // one in this block and assigning it its own value is a way of quietly
+    // overwriting it with an empty string if it happens to be defined at a
+    // different scope, which for a recipient address means an alert sent to
+    // nobody. None of them is in the repository.
+    //
+    // config.yml maps each notification role to the NAME of its variable, so
+    // pointing all three at one inbox for the first few days of testing is a
+    // change on this host and nothing else.
+
+    stages {
+        stage('Checkout') {
+            steps {
+                // config.yml comes with it. The routing table, the schedule
+                // and the grace periods are read from the repository so that
+                // a change to them is reviewable, rather than being edited on
+                // this server where nobody would see it.
+                checkout scm
+            }
+        }
+
+        stage('Check the environment') {
+            steps {
+                // This CHECKS the interpreter. NOTHING IN THIS PIPELINE MAY
+                // INSTALL ANYTHING INTO IT, and that is a hard constraint
+                // rather than a preference.
+                //
+                // The environment is a clone of the ArcGIS Pro conda
+                // environment, it lives on a shared drive, it is used by
+                // hundreds of people across the organisation, and it belongs
+                // to IT. A pip install from here would be an unreviewed change
+                // to everybody's Python, made hourly by a scheduled job. New
+                // packages go through a request to IT.
+                //
+                // So this stage's whole job is to fail loudly, at the top of
+                // the build, if the environment stops being able to run
+                // notify.py. The alternative is an ImportError two stages
+                // later that reads like a code fault.
+                //
+                // If something IS missing and IT cannot add it quickly, the
+                // way out does not touch the shared environment either:
+                // pip install --target into a directory the Jenkins account
+                // owns, and set PYTHONPATH to it as a global environment
+                // variable. Python picks it up with no change to this file.
+                //
+                // ZoneInfo is exercised rather than merely imported: Windows
+                // ships no system timezone database, so the constructor is
+                // what actually proves tzdata is present, and the
+                // expected-slot arithmetic that stops the Friday-to-Monday
+                // backup gap from false-alarming is entirely timezone
+                // conversion.
+                //
+                // bat because this server is Windows. On a Linux agent both
+                // bat steps become sh and tzdata becomes unnecessary.
+                bat '''"%PYTHON%" -c "import boto3, yaml, zoneinfo; zoneinfo.ZoneInfo('America/Vancouver'); print('boto3, PyYAML and tzdata are all present')" || (echo. & echo The Python named by NOTIFY_PYTHON cannot import something notify.py needs - see jenkins/requirements.txt for the three and why. & echo Do NOT install into that environment. It is on a shared drive, it is used across the organisation, and it belongs to IT. & echo Either raise a request with IT, or pip install --target into a directory this account owns and set PYTHONPATH to it. & exit /b 1)'''
+            }
+        }
+
+        stage('Poll and notify') {
+            steps {
+                // Credentials come from the Jenkins credentials store, never
+                // inline and never in the repository. The same S3 key pair the
+                // Actions jobs use; this job only ever reads with it.
+                withCredentials([
+                    string(credentialsId: 's3-nrs-endpoint', variable: 'S3_NRS_ENDPOINT'),
+                    string(credentialsId: 's3-gss-geodrive-key-id', variable: 'S3_GSS_GEODRIVE_KEY_ID'),
+                    string(credentialsId: 's3-gss-geodrive-secret-key', variable: 'S3_GSS_GEODRIVE_SECRET_KEY'),
+                ]) {
+                    // No shell tracing. The console log of a build is visible
+                    // to anyone with access to this server, and an echoed
+                    // command line would put the key in it.
+                    //
+                    // Set NOTIFY_DRY_RUN to 'true' on this Jenkins instance to
+                    // have the job report what it would send and send nothing.
+                    // It is a host setting rather than an edit here so that
+                    // switching it off is not a commit to a public repository
+                    // in the middle of testing. A dry run writes no state
+                    // either, so it cannot suppress the first real alert.
+                    bat '"%PYTHON%" jenkins/notify.py %NOTIFY_ARGS%'
+                }
+            }
+        }
+    }
+
+    post {
+        failure {
+            // The case nothing else covers: the notification job itself
+            // failing. Everything else in this pipeline is detected by
+            // something downstream of it, and this is not - so it goes to the
+            // developer alone, who is the only person able to act on it.
+            // DESIGN.md 8.5.
+            //
+            // The core `mail` step rather than emailext, so this needs no
+            // plugin beyond what a stock Jenkins already has. It uses
+            // Jenkins' own SMTP configuration, not SMTP_HOST - the two are
+            // set separately, and this one has to keep working on a build
+            // where notify.py never got far enough to read anything.
+            mail(
+                to: "${env.ALERT_DEVELOPER}",
+                subject: "[Water Licensed Works] The notification job failed - build ${env.BUILD_NUMBER}",
+                body: """The hourly notification job on the GIS server failed.
+
+While it is failing, no alert from the backup or check jobs is being
+delivered. Those jobs are unaffected and are still running in GitHub
+Actions, and their results are still being written to object storage, so
+nothing is lost - the alerts are delayed rather than missed, and will be
+sent once this is fixed.
+
+Build: ${env.BUILD_URL}
+"""
+            )
+        }
+    }
+}
