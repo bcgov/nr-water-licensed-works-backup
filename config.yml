@@ -156,6 +156,16 @@ schedule:
   backup_days: [monday, wednesday, friday]
   checks_daily: true
 
+  # The UTC hour each cron fires at, taken straight from the workflow files
+  # above. The notify job reads these rather than a local hour, because the
+  # crons ARE in UTC: read that way the expected slot is exact all year, where
+  # a local hour would be an hour out for whichever half of the year is not
+  # the one it was written in. The local day filter above is then applied to
+  # the local weekday of each UTC instant, which reproduces the cron's
+  # one-day-ahead UTC day list without this being written down twice.
+  checks_cron_utc_hour: 2
+  backup_cron_utc_hour: 4
+
   # Staleness is measured from the EXPECTED SLOT, not as hours since
   # the last run. Measuring hours-since would false-alarm every weekend,
   # because the Friday-to-Monday backup gap is 72 hours by design.
@@ -367,6 +377,14 @@ notifications:
 
   # The relay is reachable from the GIS server only, never from a GitHub
   # runner. Set on the Jenkins host: SMTP_HOST, SMTP_SENDER.
+  #
+  # Plain SMTP on the internal network, no authentication and no TLS, which
+  # is what the existing staging script has always used. If the relay ever
+  # starts requiring credentials that is a change to make deliberately.
+  smtp_port: 25
+  # An unreachable relay must fail the poll rather than hang an hourly job
+  # until the next one starts on top of it.
+  smtp_timeout_seconds: 30
 
   # DESIGN.md section 8.4. An empty list means no mail is sent.
   # Sending routine noise to the shared inbox is the fastest way to have
