@@ -242,6 +242,26 @@ def read_bytes(storage, key):
     return storage.client.get_object(Bucket=storage.bucket, Key=source)["Body"].read()
 
 
+def write_bytes(storage, key, data):
+    """Write bytes straight to one key and return the full key.
+
+    The counterpart to read_bytes, and for the same objects: the small JSON
+    this project produces - status objects and metrics files - which is built
+    in memory and has nothing on disk to stream. Both callers previously wrote
+    a temporary file only so that upload_file had something to send.
+
+    Never use it for an artifact. upload_file streams a geodatabase from disk
+    and switches to a multipart upload above 8 MB; this would hold the whole
+    thing in memory to send it in one part.
+    """
+    destination = full_key(storage, key)
+    storage.client.put_object(Bucket=storage.bucket, Key=destination, Body=data)
+    logger.info(
+        "Wrote s3://%s/%s (%s bytes)", storage.bucket, destination, f"{len(data):,}"
+    )
+    return destination
+
+
 def copy_key(storage, source_key, destination_key):
     """Copy an object within the project prefix, server side.
 

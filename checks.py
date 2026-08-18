@@ -23,8 +23,8 @@ nothing here may assume GitHub Actions, and nothing may import arcpy.
 
 For the same reason this module must not import backup.py, which pulls in
 pyogrio to read a File Geodatabase. That dependency has no business on the
-NRIDS server, so the handful of helpers the two modules share are duplicated
-rather than imported - see the note above safe_reason().
+NRIDS server, so the handful of helpers the two jobs share live in status.py,
+which both can import because it is standard library and storage.py.
 
 Every AGOL call lives in one of the thin query functions below, each doing
 nothing but issue a query and return a plain Python value. The rule
@@ -44,16 +44,22 @@ import logging
 import math
 import os
 import statistics
-import subprocess
-import tempfile
 import time
 from dataclasses import dataclass
-from pathlib import Path
-from zoneinfo import ZoneInfo
 
 from arcgis.gis import GIS
 
 import storage
+# Shared with backup.py, which cannot be imported here - see the module
+# docstring. status.py carries these so that one edit is one edit.
+from status import (
+    local_date_stamp,
+    resolve_code_version,
+    safe_reason,
+    schema_fingerprint,
+    utc_now,
+    utc_stamp,
+)
 
 logger = logging.getLogger("checks")
 
@@ -130,135 +136,6 @@ class Violation:
     severity: str
     comparison: str
     message: str
-
-
-# ---------------------------------------------------------------------------
-# Shared with backup.py, duplicated on purpose
-#
-# checks.py must not import backup.py: that module imports pyogrio to read a
-# File Geodatabase, and the Phase 2 target has no reason to carry a GDAL
-# dependency to run a few queries. DESIGN.md 12 lists no shared utility
-# module either, so the two honest options were to duplicate these here or to
-# move them into status.py, which does not exist until Step 4.
-#
-# They are duplicated for now and belong in status.py when it is written -
-# every one of them is pure standard library, which is exactly what makes
-# status.py able to hold them without giving checks.py a pyogrio dependency
-# by the back door. Until then, an edit to one of these needs the same edit
-# in backup.py.
-# ---------------------------------------------------------------------------
-
-
-def safe_reason(exc):
-    """What to say about a failure in a log or an alert.
-
-    The errors this module raises are written for a maintainer to read and
-    are safe to repeat. Anything else is reported by type only: this
-    repository is public, its workflow logs are world readable, and GitHub
-    masks a secret only on an exact string match - it will not catch a token
-    embedded in a URL inside an arcgis or botocore message. preflight.py is
-    the tool for getting at the detail, run from a machine where the output
-    is private.
-    """
-    if isinstance(exc, (ValueError, TimeoutError, RuntimeError)):
-        return str(exc)
-    return f"{type(exc).__name__} - run preflight.py on a private machine for detail"
-
-
-def resolve_code_version():
-    """Which code produced this run, recorded in the metrics file.
-
-    The whole purpose is to let a future reader tell "the data changed" from
-    "our code changed" (DESIGN.md 7.7). Actions sets GITHUB_SHA to the commit
-    being run; a run from someone's machine falls back to git.
-
-    The -dirty suffix is the part that earns its place. With uncommitted
-    edits in the tree HEAD still names the last commit, but what actually ran
-    was that commit plus changes nobody can reconstruct afterwards. A hand
-    run during the baseline period with a half-finished edit would otherwise
-    produce an authoritative-looking row that quietly poisons the
-    distribution the thresholds are derived from. Marked, it can be excluded.
-    """
-    actions_sha = os.getenv("GITHUB_SHA")
-    if actions_sha:
-        return actions_sha[:7]
-
-    try:
-        head = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
-            capture_output=True, text=True, check=True,
-        ).stdout.strip()
-        uncommitted = subprocess.run(
-            ["git", "status", "--porcelain"],
-            capture_output=True, text=True, check=True,
-        ).stdout.strip()
-    except (OSError, subprocess.CalledProcessError):
-        # Not a git checkout, or git is not on the path - which is the normal
-        # case for the Phase 2 call from the NRIDS server. Worth recording as
-        # unknown rather than failing a check over it.
-        return "unknown"
-
-    return f"{head}-dirty" if uncommitted else head
-
-
-def utc_now():
-    """Everything is stored and compared in UTC."""
-    return datetime.datetime.now(datetime.timezone.utc)
-
-
-def utc_stamp(moment):
-    """ISO 8601 with a trailing Z - the form used in every key and record."""
-    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def local_date_stamp(config):
-    """Today's date in the configured timezone, e.g. '2026-08-14'.
-
-    This names the metrics file, so it has to be the same zone backup.py
-    stamps a rotating set with: the two are paired by date when promotion
-    looks for the check that covered a set. A check running at 17:00 on a
-    Vancouver Friday is already Saturday in UTC, which would file it under
-    the wrong day.
-    """
-    return datetime.datetime.now(ZoneInfo(config["timezone"])).strftime("%Y-%m-%d")
-
-
-def schema_fingerprint(layer_properties):
-    """A comparable summary of one layer's schema.
-
-    Kept identical to backup.py's, so that the fingerprint in a manifest and
-    the fingerprint in a metrics file describe the same thing. Sorted
-    throughout so that the service reordering its own JSON is not mistaken
-    for a change.
-
-    Per layer, never shared: points has no DISPLAY_COLOUR, and although both
-    domains are named LWL_FCODES they are different domains with
-    non-overlapping code sets.
-    """
-    fields = [
-        {"name": field_definition["name"], "type": field_definition["type"]}
-        for field_definition in sorted(
-            layer_properties.get("fields", []), key=lambda f: f["name"]
-        )
-    ]
-
-    domains = {}
-    for field_definition in layer_properties.get("fields", []):
-        domain = field_definition.get("domain")
-        if domain and domain.get("type") == "codedValue":
-            domains[field_definition["name"]] = {
-                "name": domain.get("name"),
-                "coded_values": sorted(
-                    str(value["code"]) for value in domain.get("codedValues", [])
-                ),
-            }
-
-    subtypes = sorted(
-        f"{entry.get('id')}:{entry.get('name')}"
-        for entry in layer_properties.get("types", [])
-    )
-
-    return {"fields": fields, "domains": domains, "subtypes": subtypes}
 
 
 # ---------------------------------------------------------------------------
@@ -1287,15 +1164,15 @@ def write_metrics(store, config, date_stamp, payload):
     """Write one day's metrics file.
 
     The name is the contract backup.prune_metrics reads, so it is built by
-    metrics_key and never assembled here. Written through a temporary file
-    because storage.py uploads from disk.
+    metrics_key and never assembled here.
+
+    Sorted and indented so that a person can read the file and a diff between
+    two days is legible.
     """
     key = metrics_key(config, date_stamp)
-    with tempfile.TemporaryDirectory(prefix="wlw_checks_") as work_dir:
-        local_path = Path(work_dir) / f"{date_stamp}.json"
-        with open(local_path, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2, sort_keys=True)
-        storage.upload_file(store, local_path, key)
+    storage.write_bytes(
+        store, key, json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
+    )
     return key
 
 

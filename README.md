@@ -46,7 +46,7 @@ requirements.txt      pinned dependencies
 backup.py             export, manifest, upload, promote, prune
 checks.py             metrics and comparison; importable, no arcpy
 storage.py            object storage wrapper
-status.py             writes the run status object
+status.py             run status object, and the helpers both jobs share
 run_backup.py         entry point
 run_checks.py         entry point
 preflight.py          read-only environment and assumption check
@@ -57,6 +57,8 @@ docs/                 restore runbooks and guides
 ```
 
 `jenkins/` is deliberately isolated and shares no imports with the rest of the repository, so the server running it needs no project dependencies beyond `boto3`.
+
+`checks.py` is isolated in the other direction: it never imports `backup.py`, which needs a geodatabase reader that the internal server has no reason to install just to run a few queries. Anything the two jobs share therefore lives in `status.py`, which imports nothing beyond `storage.py` and the standard library.
 
 
 ## Configuration
@@ -79,7 +81,7 @@ Secrets come from the environment only. The three stores below are independent �
 | `S3_GSS_GEODRIVE_SECRET_KEY` | object storage secret | ✓ | ✓ |
 | `AGO_USERNAME_WINS` | ArcGIS Online account | ✓ | — |
 | `AGO_PASSWORD_WINS` | ArcGIS Online account | ✓ | — |
-| `SMTP_SERVER` | mail relay | — | ✓ |
+| `SMTP_HOST` | mail relay | — | ✓ |
 | `SMTP_SENDER` | sender address | — | ✓ |
 | `ALERT_*` | recipient addresses, one variable per role | — | ✓ |
 
@@ -112,14 +114,16 @@ Dependency versions are pinned. These jobs run unattended, and an unpinned depen
 
 ## Schedules
 
-| Job | Cadence |
-|---|---|
-| Backup | Monday, Wednesday, Friday — after hours, before the nightly staging push |
-| Checks | Daily, late afternoon — after the day's editing, with time to act |
-| Notification poll | Hourly |
-| Weekly summary | Monday morning |
+| Job | Cadence | Local time |
+|---|---|---|
+| Backup | Monday, Wednesday, Friday — after hours, before the nightly staging push | 20:00 PDT / 19:00 PST |
+| Checks | Daily, evening — after the day's editing, with time to act | 19:00 PDT / 18:00 PST |
+| Notification poll | Hourly | — |
+| Weekly summary | Monday morning | 08:00 |
 
 The cadence settings in `config.yml` and the cron expressions in the workflow files must be kept in step, because the notification job uses the former to decide whether a run is overdue.
+
+GitHub Actions cron is UTC and has no timezone support, so each slot is written in UTC and shifts by an hour across daylight saving. The backup's UTC day-of-week list is deliberately one day ahead of the local one: 20:00 on a Vancouver Monday is already Tuesday in UTC. The check runs an hour before the backup on the same local date, because a backup is promoted to the monthly tier only if that day's check passed.
 
 
 ## Storage layout

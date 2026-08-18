@@ -33,7 +33,6 @@ import hashlib
 import json
 import logging
 import os
-import subprocess
 import tempfile
 import time
 import zipfile
@@ -46,6 +45,17 @@ from arcgis.features import FeatureLayerCollection
 from arcgis.gis import GIS
 
 import storage
+# Shared with checks.py. They live in status.py because checks.py must not
+# import this module - pyogrio is a GDAL dependency with no business on the
+# NRIDS server in Phase 2 - and status.py is the one module both jobs import.
+from status import (
+    local_date_stamp,
+    resolve_code_version,
+    safe_reason,
+    schema_fingerprint,
+    utc_now,
+    utc_stamp,
+)
 
 logger = logging.getLogger("backup")
 
@@ -90,78 +100,6 @@ def connect_to_agol(config):
         os.getenv("AGO_USERNAME_WINS"),
         os.getenv("AGO_PASSWORD_WINS"),
     )
-
-
-def safe_reason(exc):
-    """What to say about a failure in a log or an alert.
-
-    The errors this module raises are written for a maintainer to read and
-    are safe to repeat. Anything else is reported by type only: this
-    repository is public, its workflow logs are world readable, and GitHub
-    masks a secret only on an exact string match - it will not catch a token
-    embedded in a URL inside an arcgis or botocore message. preflight.py is
-    the tool for getting at the detail, run from a machine where the output
-    is private.
-    """
-    if isinstance(exc, (ValueError, TimeoutError, RuntimeError)):
-        return str(exc)
-    return f"{type(exc).__name__} - run preflight.py on a private machine for detail"
-
-
-def resolve_code_version():
-    """Which code produced this run, for the manifest and the status object.
-
-    The whole purpose is to let a future reader tell "the data changed" from
-    "our code changed" (DESIGN.md 7.7). Actions sets GITHUB_SHA to the commit
-    being run; a run from someone's machine falls back to git.
-
-    The -dirty suffix is the part that earns its place. With uncommitted
-    edits in the tree HEAD still names the last commit, but what actually ran
-    was that commit plus changes nobody can reconstruct afterwards. A hand
-    run during the baseline period with a half-finished edit would otherwise
-    produce an authoritative-looking record that quietly poisons the
-    distribution the thresholds are derived from. Marked, it can be excluded.
-    """
-    actions_sha = os.getenv("GITHUB_SHA")
-    if actions_sha:
-        return actions_sha[:7]
-
-    try:
-        head = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
-            capture_output=True, text=True, check=True,
-        ).stdout.strip()
-        uncommitted = subprocess.run(
-            ["git", "status", "--porcelain"],
-            capture_output=True, text=True, check=True,
-        ).stdout.strip()
-    except (OSError, subprocess.CalledProcessError):
-        # Not a git checkout, or git is not on the path. Worth recording as
-        # unknown rather than failing a backup over it.
-        return "unknown"
-
-    return f"{head}-dirty" if uncommitted else head
-
-
-def utc_now():
-    """Everything is stored and compared in UTC."""
-    return datetime.datetime.now(datetime.timezone.utc)
-
-
-def utc_stamp(moment):
-    """ISO 8601 with a trailing Z - the form used in every key and record."""
-    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def local_date_stamp(config):
-    """Today's date in the configured timezone, e.g. '2026-08-14'.
-
-    Local rather than UTC because this names the dated prefix and decides
-    which calendar month a set is promoted into. A backup running at 19:00 on
-    a Vancouver Friday is already Saturday in UTC, which would file it under
-    the wrong day and, on the last day of a month, the wrong month.
-    """
-    return datetime.datetime.now(ZoneInfo(config["timezone"])).strftime("%Y-%m-%d")
 
 
 def sha256_of_file(path):
@@ -370,43 +308,6 @@ def validate_artifact(zip_path, live_count, layer_key, config, work_dir):
         "artifact_bytes": zip_path.stat().st_size,
         "sha256": sha256_of_file(zip_path),
     }
-
-
-def schema_fingerprint(layer_properties):
-    """A comparable summary of one layer's schema.
-
-    Recorded per layer in the manifest and compared by the check job's
-    exact_match rule - the one threshold in config.yml that is not a
-    placeholder, because any schema change should be looked at. Sorted
-    throughout so that the service reordering its own JSON is not mistaken
-    for a change.
-
-    Per layer, never shared: points has no DISPLAY_COLOUR, and although both
-    domains are named LWL_FCODES they are different domains with
-    non-overlapping code sets.
-    """
-    fields = [
-        {"name": field["name"], "type": field["type"]}
-        for field in sorted(layer_properties.get("fields", []), key=lambda f: f["name"])
-    ]
-
-    domains = {}
-    for field in layer_properties.get("fields", []):
-        domain = field.get("domain")
-        if domain and domain.get("type") == "codedValue":
-            domains[field["name"]] = {
-                "name": domain.get("name"),
-                "coded_values": sorted(
-                    str(value["code"]) for value in domain.get("codedValues", [])
-                ),
-            }
-
-    subtypes = sorted(
-        f"{entry.get('id')}:{entry.get('name')}"
-        for entry in layer_properties.get("types", [])
-    )
-
-    return {"fields": fields, "domains": domains, "subtypes": subtypes}
 
 
 def write_json(path, payload):
