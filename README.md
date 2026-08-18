@@ -39,7 +39,9 @@ File geodatabase is used because it preserves field types, nulls, coded-value do
 
 Staleness is measured from the slot a run was *due* in, never as hours since the last run: the Friday-to-Monday backup gap is 72 hours by design and would otherwise raise a false alarm every weekend.
 
-The poll is hourly and the email is not. Mail goes out on a change of situation, so a failure lasting five days produces two messages — one alert and one resolution — whichever frequency the job polls at. Polling frequently buys latency, nothing else. The notification job reads object storage and writes nothing to it.
+The poll is hourly and the email is not. Mail goes out on a change of situation, so a failure lasting five days produces two messages — one alert and one resolution — whichever frequency the job polls at. Polling frequently buys latency, nothing else.
+
+The notification job reads the status objects and writes exactly one thing: its own record of what it has already sent, kept under a `notify/` prefix outside every backup tier. It deletes and copies nothing, and it holds no ArcGIS Online credentials at all.
 
 
 ## Repository layout

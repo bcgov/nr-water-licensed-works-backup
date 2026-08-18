@@ -78,31 +78,15 @@ pipeline {
     }
 
     environment {
-        // The deduplication state, and the one thing this job writes anywhere.
-        // It remembers what was last notified about, which is what turns an
-        // hourly poll into occasional email (DESIGN.md 8.5).
-        //
-        // Three requirements on the path, in order of how badly they bite:
-        //
-        // NOT IN THE JENKINS WORKSPACE. A wiped or freshly checked-out
-        // workspace looks exactly like a notifier that has never sent
-        // anything, so every open alert would be sent again - and workspaces
-        // are wiped routinely.
-        //
-        // NOT IN JENKINS_HOME either, which was the earlier default and is
-        // wrong here: this is a shared Jenkins service and that directory
-        // belongs to whoever administers it. A project's working file has no
-        // business in another team's application directory.
-        //
-        // WRITABLE BY THE ACCOUNT THE JENKINS AGENT RUNS AS, which is not
-        // necessarily the account of the person who set the job up. This is
-        // the one worth testing rather than assuming.
-        //
-        // So it is a project-owned directory on the GIS server, named by a
-        // credential like everything else so the path stays out of a public
-        // repository.
-        NOTIFY_STATE_FILE = credentials('wlw-state-file')
-
+        // The deduplication state - what this job last sent mail about, and
+        // the thing that turns an hourly poll into occasional email - needs no
+        // setting here. It lives in object storage under the project's own
+        // notify/ prefix (DESIGN.md 8.5), which means this job needs no
+        // writable directory on this server, no permission from whoever
+        // administers this Jenkins, and nothing that survives a workspace
+        // wipe. It also means the job keeps working if it lands on a different
+        // agent from one hour to the next, which 'agent any' allows and a
+        // state file on one agent's disk would silently break.
         NOTIFY_ARGS = "${params.DRY_RUN ? '--dry-run' : ''}"
 
         // EVERY SETTING BELOW COMES FROM THE FOLDER CREDENTIAL STORE, and that

@@ -61,6 +61,13 @@ storage:
     yearly: yearly/
     metrics: metrics/
     status: status/
+    # Only jenkins/notify.py reads or writes under here, and the only object
+    # it holds is that job's deduplication state - what it last sent mail
+    # about, so that an hourly poll produces occasional email rather than
+    # hourly email. It is not a backup and nothing restores from it; losing it
+    # costs one duplicate alert. Kept as a sibling of the tiers rather than
+    # inside one so that nobody looking for a restore point finds it.
+    notify: notify/
 
 
 backup:

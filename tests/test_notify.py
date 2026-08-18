@@ -38,6 +38,7 @@ from types import SimpleNamespace
 
 import pytest
 import yaml
+from botocore.exceptions import ClientError
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -122,15 +123,19 @@ def run(job, moment, run_status, summary=None, details=None):
     return moment, f"{STATUS_PATH}{payload['run_id']}.json", payload
 
 
-def bucket_at(entries, now, extra_keys=()):
+STATE_KEY = "notify/state.json"
+
+
+def bucket_at(entries, now, extra_keys=(), written=None):
     """A Bucket holding every status object written at or before `now`.
 
     Objects appear as their runs happen, so polling the same entries an hour
     later sees exactly what Jenkins would have seen an hour later.
 
-    The write methods refuse. This job reads the bucket and writes nothing to
-    it, which cannot be enforced by a permission - the bucket issues one
-    full-access key pair (DESIGN.md 6.6) - so it is enforced here instead.
+    Writes go into `written`, keyed by full key, so a test can assert both what
+    was written and - just as important - that nothing else was. Deleting and
+    copying refuse outright: this job has no business doing either, and the
+    bucket it is pointed at holds every backup this project has.
     """
     visible = {key: payload for moment, key, payload in entries if moment <= now}
 
@@ -140,16 +145,31 @@ def bucket_at(entries, now, extra_keys=()):
         return [{"Contents": [{"Key": key} for key in listed if key.startswith(wanted)]}]
 
     def get_object(Bucket, Key):
-        body = json.dumps(visible[Key[len(PREFIX):]]).encode("utf-8")
+        relative = Key[len(PREFIX):]
+        if relative in visible:
+            payload = visible[relative]
+        elif written is not None and Key in written:
+            # `written` outlives one Bucket, so a state object put by an
+            # earlier poll is still there for the next one. That is the whole
+            # point of it being in the bucket rather than on an agent.
+            payload = written[Key]
+        else:
+            raise ClientError({"Error": {"Code": "NoSuchKey"}}, "GetObject")
+        body = json.dumps(payload).encode("utf-8")
         return {"Body": SimpleNamespace(read=lambda: body)}
 
+    def put_object(Bucket, Key, Body):
+        if written is None:
+            raise AssertionError(f"this test did not expect a write, and got one to {Key}")
+        written[Key] = json.loads(Body)
+
     def refuse(*args, **kwargs):
-        raise AssertionError("notify.py must never write to the bucket")
+        raise AssertionError("notify.py must never delete from or copy in the bucket")
 
     client = SimpleNamespace(
         get_paginator=lambda name: SimpleNamespace(paginate=paginate),
         get_object=get_object,
-        put_object=refuse,
+        put_object=put_object,
         copy_object=refuse,
         delete_object=refuse,
     )
@@ -182,7 +202,8 @@ def poll_hourly(entries, start, end, state=None, extra_keys=()):
     state = quiet_state(start) if state is None else state
     now = start
     while now <= end:
-        state, failures = notify.poll(CONFIG, bucket_at(entries, now, extra_keys), state, now, False)
+        bucket = bucket_at(entries, now, extra_keys)
+        state, failures = notify.poll(CONFIG, bucket, state, now, False)
         assert failures == 0
         now += datetime.timedelta(hours=1)
     return state
@@ -716,7 +737,10 @@ def test_a_dry_run_sends_nothing(sent, capsys):
 
 def test_a_dry_run_records_nothing_so_it_cannot_suppress_a_real_alert(sent):
     """Recording it would mark as sent something that was never sent, and the
-    real alert would then be deduplicated away."""
+    real alert would then be deduplicated away.
+
+    The bucket used here refuses every write, so this also asserts that a dry
+    run touches object storage no more than a listing does."""
     entries = [run("checks", at(19, 2, 6), "DATA_FAIL")]
     now = at(19, 3)
 
@@ -776,36 +800,86 @@ def test_one_unreachable_recipient_does_not_stop_the_other_alert(monkeypatch):
     assert "status:backup" in state
 
 
-def test_a_missing_state_file_starts_from_nothing(tmp_path):
-    """The first poll on a new Jenkins host. One duplicate email per open
-    condition is the accepted cost of not writing state to the bucket."""
-    assert notify.load_state(tmp_path / "absent.json") == {}
+# ---------------------------------------------------------------------------
+# The state object
+#
+# The only thing this job writes. It lives in the bucket under notify/ rather
+# than on the Jenkins host, because the Jenkins instance is a shared service
+# this project does not administer and the job is not pinned to one agent - a
+# state file on the agent that ran last hour is invisible to the one that runs
+# next, and the symptom of that is the hourly flood the design exists to
+# prevent.
+# ---------------------------------------------------------------------------
 
 
-def test_a_corrupt_state_file_is_reported_and_not_fatal(tmp_path):
-    """Failing every poll until somebody deletes it by hand is silence, and
-    silence is what this job exists to prevent."""
-    path = tmp_path / "notify-state.json"
-    path.write_text("{ this is not json", encoding="utf-8")
-    assert notify.load_state(path) == {}
+def test_the_state_lives_beside_the_tiers_and_not_inside_one():
+    """Nobody looking for a restore point should find this."""
+    assert notify.state_key(CONFIG) == STATE_KEY
+    for tier in ("rotating/", "monthly/", "yearly/"):
+        assert not STATE_KEY.startswith(tier)
 
 
-def test_the_state_round_trips(tmp_path):
-    path = tmp_path / "nested" / "notify-state.json"
+def test_a_missing_state_object_starts_from_nothing():
+    """The first ever poll. One duplicate email per open condition is the
+    accepted cost, and it happens once."""
+    assert notify.load_state(bucket_at([], at(19, 3)), CONFIG) == {}
+
+
+def test_a_storage_failure_is_not_read_as_an_empty_state():
+    """The distinction that matters. 'There is no state object' means start
+    fresh; 'the endpoint is unreachable' must not, or an outage would re-send
+    every open alert the moment it cleared."""
+    def refuse(Bucket, Key):
+        raise ClientError({"Error": {"Code": "AccessDenied"}}, "GetObject")
+
+    bucket = notify.Bucket(
+        client=SimpleNamespace(get_object=refuse), name="gssgeodrive", prefix=PREFIX
+    )
+    with pytest.raises(ClientError):
+        notify.load_state(bucket, CONFIG)
+
+
+def test_an_unreadable_state_object_is_reported_and_not_fatal():
+    """Failing every poll until somebody deletes an object by hand is silence,
+    and silence is what this job exists to prevent."""
+    def malformed(Bucket, Key):
+        return {"Body": SimpleNamespace(read=lambda: b"{ this is not json")}
+
+    bucket = notify.Bucket(
+        client=SimpleNamespace(get_object=malformed), name="gssgeodrive", prefix=PREFIX
+    )
+    assert notify.load_state(bucket, CONFIG) == {}
+
+
+def test_the_state_round_trips():
+    written = {}
+    bucket = bucket_at([], at(19, 3), written=written)
     signals = {"status:checks": {"value": "PASS", "roles": [], "sent_utc": "2026-08-19T03:00:00Z"}}
-    notify.save_state(path, signals)
-    assert notify.load_state(path) == signals
+
+    notify.save_state(bucket, CONFIG, signals)
+
+    assert list(written) == [PREFIX + STATE_KEY]
+    assert notify.load_state(bucket, CONFIG) == signals
 
 
-def test_the_state_path_prefers_the_argument_then_the_environment(monkeypatch):
-    """It must not be in the Jenkins workspace: a wiped workspace looks like a
-    notifier that has never sent anything (DESIGN.md 8.5)."""
-    monkeypatch.setenv(notify.STATE_FILE_VARIABLE, "/var/jenkins_home/notify-state.json")
-    assert notify.state_path(None) == Path("/var/jenkins_home/notify-state.json")
-    assert notify.state_path("/tmp/other.json") == Path("/tmp/other.json")
+def test_the_state_survives_the_job_moving_between_agents(sent):
+    """The reason it is in the bucket at all. Two consecutive polls that share
+    nothing but the bucket must still deduplicate - which is what a Jenkins job
+    on 'agent any' actually does."""
+    entries = [run("checks", at(19, 2, 6), "DATA_FAIL", "Points feature count fell 14%.")]
+    written = {}
 
-    monkeypatch.delenv(notify.STATE_FILE_VARIABLE, raising=False)
-    assert notify.state_path(None) == notify.DEFAULT_STATE_PATH
+    for hour in (3, 4, 5):
+        bucket = bucket_at(entries, at(19, hour), written=written)
+        # Nothing carried over in memory. Every poll rebuilds its state from
+        # the bucket, the way a fresh agent and a fresh workspace would.
+        state = notify.load_state(bucket, CONFIG)
+        updated, failures = notify.poll(CONFIG, bucket, state, at(19, hour), False)
+        assert failures == 0
+        if updated != state:
+            notify.save_state(bucket, CONFIG, updated)
+
+    assert count(sent, "DATA_FAIL") == 1
 
 
 # ---------------------------------------------------------------------------
@@ -933,7 +1007,8 @@ def test_notify_shares_no_imports_with_the_repository():
         elif isinstance(node, ast.ImportFrom) and node.module:
             imported.add(node.module.split(".")[0])
 
-    assert imported - set(sys.stdlib_module_names) == {"boto3", "yaml"}
+    # botocore comes with boto3 and is not a fourth thing to install.
+    assert imported - set(sys.stdlib_module_names) == {"boto3", "botocore", "yaml"}
     for local in ("storage", "status", "backup", "checks", "arcgis", "pyogrio"):
         assert local not in imported
 
@@ -944,17 +1019,55 @@ def test_the_jenkins_requirements_hold_only_what_that_server_needs():
     assert pinned == ["boto3", "PyYAML", "tzdata"]
 
 
-def test_notify_never_writes_to_the_bucket():
+def test_notify_never_deletes_or_copies_in_the_bucket():
     """Not a permission boundary - the bucket issues one full-access key pair
-    (DESIGN.md 6.6) - so it is a convention held here instead."""
+    (DESIGN.md 6.6), so this job could destroy every backup it is pointed at.
+    Held here instead."""
     called = {
         node.func.attr
         for node in ast.walk(ast.parse(notify_source()))
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
     }
     forbidden = {
-        "put_object", "delete_object", "delete_objects", "copy_object",
-        "upload_file", "upload_fileobj", "put_bucket_versioning",
-        "create_multipart_upload",
+        "delete_object", "delete_objects", "copy_object", "upload_file",
+        "upload_fileobj", "put_bucket_versioning", "create_multipart_upload",
+        "put_bucket_lifecycle_configuration",
     }
     assert called & forbidden == set()
+
+
+def test_the_only_write_is_the_state_object():
+    """put_object is now allowed, and this is what keeps that from widening.
+
+    Exactly one call, inside save_state, and save_state takes no key argument -
+    so no caller can point it at a backup. Adding a second write, or giving
+    that function a key parameter, fails here."""
+    tree = ast.parse(notify_source())
+
+    writers = [
+        node.name for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and any(
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "put_object"
+            for call in ast.walk(node)
+        )
+    ]
+    assert writers == ["save_state"]
+
+    save_state = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "save_state"
+    )
+    assert [argument.arg for argument in save_state.args.args] == [
+        "bucket", "config", "signals",
+    ]
+
+    # And the destination is built by state_key, which config.yml points at a
+    # prefix of its own rather than at any backup tier.
+    keys = {
+        node.func.id for node in ast.walk(save_state)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    assert "state_key" in keys

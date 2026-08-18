@@ -15,11 +15,14 @@ the body. All judgement stays in checks.py - with one deliberate exception,
 marked where it happens: no_monthly_candidate is reported in the details of a
 run whose status is PASS, and PASS routes to nobody.
 
-READ-ONLY AGAINST THE BUCKET. This job lists and reads under the status/
-prefix and writes nothing anywhere. It cannot be *restricted* to that - the
-bucket issues one full-access key pair (DESIGN.md 6.6) - so it is a convention
-held in code rather than a permission boundary. There is no put, copy or
-delete call in this file and tests/test_notify.py asserts it stays that way.
+ONE WRITE, TO ONE KEY. This job lists and reads under status/, and the only
+thing it writes anywhere is its own deduplication state, to notify/state.json.
+It never writes to a backup tier and it deletes and copies nothing at all. That
+cannot be *enforced* by a permission - the bucket issues one full-access key
+pair (DESIGN.md 6.6) - so it is enforced by shape instead: save_state takes no
+key argument, the destination is a module constant, and tests/test_notify.py
+asserts that the only write in this file goes to that key and that no delete or
+copy call exists in it.
 
 THIS FILE SHARES NO IMPORTS WITH THE REST OF THE REPOSITORY, AND THAT
 DUPLICATION IS DELIBERATE. It does not import storage.py, status.py,
@@ -63,6 +66,7 @@ from zoneinfo import ZoneInfo
 
 import boto3
 import yaml
+from botocore.exceptions import ClientError
 
 logger = logging.getLogger("notify")
 
@@ -71,18 +75,7 @@ logger = logging.getLogger("notify")
 # job can run it from anywhere in the workspace.
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.yml"
 
-# Where the dedup state is remembered between polls, and the only thing this
-# job writes anywhere. It must NOT live in the Jenkins workspace: a wiped or
-# fresh workspace looks like "nothing has ever been notified", and every open
-# condition mails again. Nor in JENKINS_HOME, which belongs to whoever
-# administers that shared service. The Jenkinsfile sets NOTIFY_STATE_FILE to a
-# directory the project owns on the GIS server. The fallback below is the home
-# directory of whoever ran it by hand, for the same durability reason.
-# DESIGN.md 8.5.
-STATE_FILE_VARIABLE = "NOTIFY_STATE_FILE"
-DEFAULT_STATE_PATH = Path.home() / ".water-licensed-works" / "notify-state.json"
-
-# Bumped if the shape of the state file changes, so a future reader can tell
+# Bumped if the shape of the state object changes, so a future reader can tell
 # an old file from a corrupt one.
 STATE_VERSION = 1
 
@@ -1018,64 +1011,78 @@ def unpromoted_month(config, record, now):
 # ---------------------------------------------------------------------------
 # The dedup state
 #
-# A small JSON file on the Jenkins host, not in the bucket. It is notifier
-# state rather than project state, and keeping it local is what preserves this
-# job's read-only relationship with the backups (DESIGN.md 8.5).
+# THE ONE THING THIS JOB WRITES, AND THE ONLY PLACE IT WRITES IT.
+#
+# It lives in the bucket, under its own notify/ prefix - a sibling of status/
+# and metrics/, never inside a backup tier. Decided 2026-08-18, reversing an
+# earlier decision to keep it on the Jenkins host, which had assumed a
+# filesystem this project does not really have: the Jenkins instance is a
+# shared service administered by another team, the job is not pinned to one
+# agent, and a state file on the agent that happened to run last poll is
+# invisible to the one that runs the next. Silently, and the symptom is the
+# hourly flood the whole design exists to prevent.
+#
+# The cost is that "the notify job never writes to the backup bucket" becomes
+# "it writes one small object to one constant key and nothing else". That is a
+# weaker sentence but the same actual risk, because the bucket issues a single
+# full-access key pair (DESIGN.md 6.6) and this job has always held one.
+#
+# So the narrower claim is made enforceable rather than promised:
+# save_state takes no key argument, STATE_KEY is a module constant, and
+# tests/test_notify.py asserts that the only write in this file goes to that
+# key and that no delete or copy call exists anywhere in it.
 # ---------------------------------------------------------------------------
 
 
-def state_path(argument):
-    """Where the state file lives: --state, then NOTIFY_STATE_FILE, then home.
-
-    It must be outside the Jenkins workspace. A wiped workspace looks exactly
-    like a notifier that has never sent anything, so every open condition
-    would mail again on the next poll.
-    """
-    if argument:
-        return Path(argument)
-    from_environment = os.getenv(STATE_FILE_VARIABLE)
-    return Path(from_environment) if from_environment else DEFAULT_STATE_PATH
+def state_key(config):
+    """The one key this job writes, under the project's notify/ prefix."""
+    return f"{config['storage']['paths']['notify']}state.json"
 
 
-def load_state(path):
+def load_state(bucket, config):
     """What was notified last time, or an empty state on the first run.
 
-    A missing file is the first run on a new Jenkins host and is not an error.
-    The cost is one duplicate email per open condition, which DESIGN.md 8.5
-    accepts as the price of not giving this job a reason to write to the
-    backup bucket.
+    A missing object is the first run and is not an error. The cost is one
+    duplicate email per open condition, which DESIGN.md 8.5 accepts.
 
-    A corrupt file is treated the same way and said so loudly, because the
+    An unreadable one is treated the same way and said so loudly, because the
     alternative - failing every poll until somebody deletes it by hand - is
     silence, and silence is what this job exists to prevent.
     """
-    if not path.exists():
-        logger.info("No state file at %s yet, so this poll starts from nothing", path)
-        return {}
+    key = state_key(config)
     try:
-        stored = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
+        raw = bucket.client.get_object(Bucket=bucket.name, Key=bucket.prefix + key)
+        return json.loads(raw["Body"].read().decode("utf-8")).get("signals", {})
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] in ("404", "NoSuchKey"):
+            logger.info("No %s yet, so this poll starts from nothing", key)
+            return {}
+        # Bad credentials, wrong bucket, endpoint unreachable. Not "there is no
+        # state" - reporting it as that would send every open alert again.
+        raise
+    except ValueError as exc:
         logger.warning(
-            "The state file at %s could not be read (%s), so this poll starts "
-            "from nothing and may repeat an alert that has already been sent. "
-            "Delete it if this recurs.", path, exc,
+            "%s could not be read (%s), so this poll starts from nothing and "
+            "may repeat an alert that has already been sent. It is rewritten "
+            "on the next send.", key, exc,
         )
         return {}
-    return stored.get("signals", {})
 
 
-def save_state(path, signals):
-    """Record what was sent, atomically.
+def save_state(bucket, config, signals):
+    """Record what was sent.
 
-    Written to a neighbouring temporary file and then moved into place, so a
-    poll that dies mid-write leaves the previous state intact rather than a
-    truncated file that reads as "nothing has ever been notified".
+    Deliberately takes no key: the destination is state_key and nothing else,
+    so no caller can point this at a backup. A put replaces the whole object in
+    one call, so there is no half-written state to guard against the way a
+    local file would need.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
     payload = {"version": STATE_VERSION, "signals": signals}
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-    temporary.replace(path)
+    bucket.client.put_object(
+        Bucket=bucket.name,
+        Key=bucket.prefix + state_key(config),
+        Body=json.dumps(payload, indent=2, sort_keys=True).encode("utf-8"),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1232,7 +1239,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(
         description=(
             "Poll the Water Licensed Works status objects and send alert mail. "
-            "Reads object storage and writes nothing to it."
+            "Reads object storage, and writes one small state object and "
+            "nothing else."
         )
     )
     parser.add_argument(
@@ -1240,19 +1248,10 @@ def main(argv=None):
         help="Path to config.yml (default: the copy alongside this repository).",
     )
     parser.add_argument(
-        "--state", default=None,
-        help=(
-            "Path to the deduplication state file. Defaults to "
-            f"${STATE_FILE_VARIABLE} and then to {DEFAULT_STATE_PATH}. It must "
-            "not be in the Jenkins workspace - a wiped workspace re-sends every "
-            "open alert."
-        ),
-    )
-    parser.add_argument(
         "--dry-run", action="store_true",
         help=(
-            "Print what would be sent and send nothing. The state file is not "
-            "written either, so a dry run cannot suppress a real alert later."
+            "Print what would be sent and send nothing. The state object is "
+            "not written either, so a dry run cannot suppress a real alert."
         ),
     )
     arguments = parser.parse_args(argv)
@@ -1263,9 +1262,8 @@ def main(argv=None):
         format="%(asctime)s %(levelname)-7s %(message)s",
     )
 
-    path = state_path(arguments.state)
-    state = load_state(path)
     bucket = connect_to_bucket(config)
+    state = load_state(bucket, config)
     now = datetime.datetime.now(datetime.timezone.utc)
 
     updated, failures = poll(config, bucket, state, now, arguments.dry_run)
@@ -1273,9 +1271,16 @@ def main(argv=None):
     if arguments.dry_run:
         # Writing it would record as sent something that was never sent, and
         # the real alert would then be deduplicated away.
-        logger.info("Dry run: nothing sent and %s not written", path)
+        logger.info("Dry run: nothing sent and %s not written", state_key(config))
+    elif updated == state:
+        # Most polls change nothing, and rewriting an identical object every
+        # hour would leave hundreds of noncurrent versions a month behind it -
+        # the bucket keeps them for 60 days (DESIGN.md 6.6). Writing only on a
+        # change keeps this to roughly one write a week.
+        logger.info("Nothing changed, so %s is left as it is", state_key(config))
     else:
-        save_state(path, updated)
+        save_state(bucket, config, updated)
+        logger.info("Recorded what was sent in %s", state_key(config))
 
     return 1 if failures else 0
 
