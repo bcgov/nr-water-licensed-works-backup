@@ -78,13 +78,30 @@ pipeline {
     }
 
     environment {
-        // The deduplication state, and the one thing on this host that must
-        // survive a build. It is deliberately NOT in the workspace: a wiped
-        // or fresh workspace looks exactly like a notifier that has never
-        // sent anything, so every open alert would be sent again. JENKINS_HOME
-        // survives a workspace wipe, is writable by the Jenkins user, and is
-        // covered by whatever backs this server up. DESIGN.md 8.5.
-        NOTIFY_STATE_FILE = "${JENKINS_HOME}/water-licensed-works/notify-state.json"
+        // The deduplication state, and the one thing this job writes anywhere.
+        // It remembers what was last notified about, which is what turns an
+        // hourly poll into occasional email (DESIGN.md 8.5).
+        //
+        // Three requirements on the path, in order of how badly they bite:
+        //
+        // NOT IN THE JENKINS WORKSPACE. A wiped or freshly checked-out
+        // workspace looks exactly like a notifier that has never sent
+        // anything, so every open alert would be sent again - and workspaces
+        // are wiped routinely.
+        //
+        // NOT IN JENKINS_HOME either, which was the earlier default and is
+        // wrong here: this is a shared Jenkins service and that directory
+        // belongs to whoever administers it. A project's working file has no
+        // business in another team's application directory.
+        //
+        // WRITABLE BY THE ACCOUNT THE JENKINS AGENT RUNS AS, which is not
+        // necessarily the account of the person who set the job up. This is
+        // the one worth testing rather than assuming.
+        //
+        // So it is a project-owned directory on the GIS server, named by a
+        // credential like everything else so the path stays out of a public
+        // repository.
+        NOTIFY_STATE_FILE = credentials('wlw-state-file')
 
         NOTIFY_ARGS = "${params.DRY_RUN ? '--dry-run' : ''}"
 

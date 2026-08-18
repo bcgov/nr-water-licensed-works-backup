@@ -71,12 +71,14 @@ logger = logging.getLogger("notify")
 # job can run it from anywhere in the workspace.
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.yml"
 
-# Where the dedup state is remembered between polls. It must NOT live in the
-# Jenkins workspace: a wiped or fresh workspace looks like "nothing has ever
-# been notified", and every open condition mails again. The Jenkinsfile sets
-# NOTIFY_STATE_FILE under JENKINS_HOME, which survives a workspace wipe and is
-# always writable by the Jenkins user. The fallback is the home directory of
-# whoever ran it by hand, for the same reason. DESIGN.md 8.5.
+# Where the dedup state is remembered between polls, and the only thing this
+# job writes anywhere. It must NOT live in the Jenkins workspace: a wiped or
+# fresh workspace looks like "nothing has ever been notified", and every open
+# condition mails again. Nor in JENKINS_HOME, which belongs to whoever
+# administers that shared service. The Jenkinsfile sets NOTIFY_STATE_FILE to a
+# directory the project owns on the GIS server. The fallback below is the home
+# directory of whoever ran it by hand, for the same durability reason.
+# DESIGN.md 8.5.
 STATE_FILE_VARIABLE = "NOTIFY_STATE_FILE"
 DEFAULT_STATE_PATH = Path.home() / ".water-licensed-works" / "notify-state.json"
 
