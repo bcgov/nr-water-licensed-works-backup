@@ -1,0 +1,56 @@
+# Dependencies for the notification job, and for nothing else.
+#
+# This file exists so that arcgis is never installed on the GIS server. The
+# whole argument for the hybrid design (DESIGN.md 8.1) is that the notify job
+# needs none of the pipeline's machinery - no arcgis, no arcpy, no GDAL - and
+# jenkins/notify.py shares no imports with the rest of the repository so that
+# this list can stay this short.
+#
+# THIS FILE IS A REQUIREMENT, NOT AN INSTRUCTION. Nothing installs it.
+#
+# On the GIS server the job runs in a clone of the ArcGIS Pro conda environment
+# which sits on a shared drive, is used by hundreds of people, and belongs to
+# IT. Nothing in this repository may install into it - a pip install from a
+# scheduled job would be an unreviewed hourly change to everybody's Python.
+# New packages there go through a request to IT.
+#
+# So the Jenkinsfile CHECKS instead: its first stage imports these and
+# constructs a ZoneInfo, and fails the build with an explanation if it cannot.
+# This file is the record of what that environment has to be able to provide.
+#
+# If one is missing and cannot be added, the way round it also leaves the
+# shared environment alone:
+#
+#     pip install --target D:\jenkins\python-libs PyYAML tzdata
+#
+# then set PYTHONPATH to that directory as a Jenkins global environment
+# variable. Python finds it, the shared drive is untouched, and notify.py needs
+# no change.
+#
+# Versions are the combination known to work, not a floor or a ceiling. If the
+# conda environment carries a different version of one of these, that is fine -
+# do not try to force it to match, and do not pin against it.
+
+# Reads the status objects from object storage. Pure Python.
+boto3==1.43.71
+
+# Reads config.yml, which is the single source of truth for the routing
+# table, the schedule and the grace periods.
+#
+# The stricter reading of the constraint was "boto3 and standard library
+# only", and PyYAML is not standard library. The purpose of that constraint is
+# that this server never has arcgis or arcpy installed, not that the list is
+# literally one package: PyYAML is small, pure Python, and installs from a
+# wheel with no build step. The alternative was generating a JSON copy of the
+# routing table for this job to read, which keeps the list at one package and
+# creates a second copy of the routing that can drift from the first. Two
+# sources of truth for who gets told about a DATA_FAIL is the worse outcome.
+# Decided 2026-08-18, recorded at DESIGN.md 9.1.
+PyYAML==6.0.3
+
+# The timezone database. Windows ships no system tz database, so
+# ZoneInfo('America/Vancouver') raises ZoneInfoNotFoundError without this -
+# and the expected-slot arithmetic that keeps the Friday-to-Monday backup gap
+# from false-alarming every weekend is entirely timezone conversion. Data
+# only, no code.
+tzdata==2026.3

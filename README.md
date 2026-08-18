@@ -37,6 +37,10 @@ File geodatabase is used because it preserves field types, nulls, coded-value do
 
 **Notification** is a hybrid. The GitHub Actions jobs do all the work and write a status object to object storage on every run. A small JENKINS job on an internal GTS server polls those objects and sends email, because the internal mail relay is not reachable from GitHub-hosted runners. That job also asserts the schedule positively — if an expected run produced no result, it alerts. A scheduled job that silently stops otherwise looks identical to one that keeps passing.
 
+Staleness is measured from the slot a run was *due* in, never as hours since the last run: the Friday-to-Monday backup gap is 72 hours by design and would otherwise raise a false alarm every weekend.
+
+The poll is hourly and the email is not. Mail goes out on a change of situation, so a failure lasting five days produces two messages — one alert and one resolution — whichever frequency the job polls at. Polling frequently buys latency, nothing else. The notification job reads object storage and writes nothing to it.
+
 
 ## Repository layout
 
@@ -50,13 +54,13 @@ status.py             run status object, and the helpers both jobs share
 run_backup.py         entry point
 run_checks.py         entry point
 preflight.py          read-only environment and assumption check
-jenkins/              notification job; boto3 and standard library only
+jenkins/              notification job, with its own short requirements.txt
 tests/                known-answer tests for the check rules
 docs/                 restore runbooks and guides
 .github/workflows/    scheduled jobs
 ```
 
-`jenkins/` is deliberately isolated and shares no imports with the rest of the repository, so the server running it needs no project dependencies beyond `boto3`.
+`jenkins/` is deliberately isolated and shares no imports with the rest of the repository. It installs from `jenkins/requirements.txt` — `boto3`, `PyYAML` and `tzdata`, all pure Python — so the server running it never has `arcgis` or a geodatabase reader installed. The small amount of duplication that isolation costs is deliberate and is marked as such in the code.
 
 `checks.py` is isolated in the other direction: it never imports `backup.py`, which needs a geodatabase reader that the internal server has no reason to install just to run a few queries. Anything the two jobs share therefore lives in `status.py`, which imports nothing beyond `storage.py` and the standard library.
 
