@@ -1,0 +1,90 @@
+# Daily integrity checks on the WATER_LICENSED_WORKS hosted feature layers.
+#
+# Collects the metrics in DESIGN.md 7.2 from live queries, compares them
+# against the history, writes metrics/<date>.json and a status object under
+# status/. Read-only against the production layers: it authenticates, reads
+# layer definitions and issues count, extent, statistic and envelope queries,
+# and never edits a feature.
+#
+# The notification job on the GIS server polls status/ hourly and sends the
+# mail. This workflow does not email anybody.
+
+name: Checks
+
+on:
+  schedule:
+    # 02:00 UTC daily = 19:00 the previous evening in Vancouver during PDT,
+    # 18:00 during PST. Actions cron has no timezone, so the hour drifts by
+    # one across daylight saving; both land after the day's editing and
+    # before the nightly staging push, which is what DESIGN.md 9 asks for.
+    #
+    # Note that this fires on the UTC day AFTER the local day it is checking.
+    # checks.py stamps the metrics file with the local date via
+    # status.local_date_stamp, which is what keeps that straight, and is why
+    # nothing here passes a date in.
+    #
+    # It also runs one hour before the backup slot, so that a backup can find
+    # the same local day's check and promote against it. Moving either cron
+    # without the other breaks monthly promotion. One hour is enough for a
+    # six-minute run with room for Actions being late, but it is tighter than
+    # it looks - see the note on the backup cron.
+    - cron: "0 2 * * *"
+
+  # The only other trigger. Never pull_request_target: on a public repository
+  # that one DOES pass secrets to a pull request from a fork, and it is the
+  # standard route for exfiltrating them.
+  workflow_dispatch:
+
+# Set explicitly rather than inheriting the organisation default. This job
+# reads the repository and writes to object storage; it needs nothing else,
+# and in particular no write access to the repository itself.
+permissions:
+  contents: read
+
+# One check run at a time. Two would issue 2,040 grid queries each against
+# the same service and race to write the same metrics/<date>.json.
+concurrency:
+  group: checks
+  cancel-in-progress: false
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    # A run is about six minutes, nearly all of it the 1,020 spatial grid
+    # queries per layer. The margin is for AGOL being slow rather than for
+    # more work.
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          # arcgis pulls in roughly 70 packages, so an uncached install is
+          # several minutes of the run.
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install --requirement requirements.txt
+
+      - name: Run the checks
+        env:
+          AGO_USERNAME_WINS: ${{ secrets.AGO_USERNAME_WINS }}
+          AGO_PASSWORD_WINS: ${{ secrets.AGO_PASSWORD_WINS }}
+          S3_NRS_ENDPOINT: ${{ secrets.S3_NRS_ENDPOINT }}
+          S3_GSS_GEODRIVE_KEY_ID: ${{ secrets.S3_GSS_GEODRIVE_KEY_ID }}
+          S3_GSS_GEODRIVE_SECRET_KEY: ${{ secrets.S3_GSS_GEODRIVE_SECRET_KEY }}
+        # No shell tracing anywhere in this file. Logs on a public repository
+        # are world readable, and GitHub masks a secret only on an exact
+        # string match - it will not catch one that has been URL-encoded,
+        # split across lines, or embedded in a URL inside a traceback. The
+        # code reports failures through status.safe_reason for the same
+        # reason; preflight.py is the tool for getting at detail, run from a
+        # machine where the output is private.
+        #
+        # The exit code is not a copy of the status. PASS, BASELINE and WARN
+        # exit 0 - a WARN is below the action threshold by definition, and a
+        # workflow that goes red on one teaches everybody to ignore red.
+        # DATA_FAIL, SYSTEM_FAIL and a failed status write exit 1.
+        run: python run_checks.py

@@ -1,0 +1,114 @@
+# Scheduled backup of the WATER_LICENSED_WORKS hosted feature layers.
+#
+# Exports both layers to File Geodatabases, validates the artifacts, writes a
+# manifest and a service definition, uploads the set under a new date-stamped
+# prefix, promotes to the monthly and yearly tiers where eligible, and prunes
+# old sets last.
+#
+# Read-only against the production layers. The one write of any kind is
+# item.export(), which creates a temporary item in the backup account's own
+# content folder and deletes it again once downloaded. There is no restore
+# path here and no workflow that triggers one: recovery is a manual decision
+# made by the data owner.
+#
+# The notification job on the GIS server polls status/ hourly and sends the
+# mail. This workflow does not email anybody.
+
+name: Backup
+
+on:
+  schedule:
+    # 03:00 UTC Tue/Thu/Sat = 20:00 Mon/Wed/Fri in Vancouver during PDT,
+    # 19:00 during PST.
+    #
+    # The UTC days are deliberately one ahead of the local days. A backup at
+    # 20:00 on a Vancouver Monday is already 03:00 Tuesday in UTC, so a cron
+    # of MON/WED/FRI would run on the wrong local evenings. config.yml's
+    # schedule.backup_days holds the LOCAL days, because that is what the
+    # notify job's expected-slot arithmetic needs; the two are the same
+    # schedule written in two timezones and have to be changed together.
+    #
+    # One hour after the check slot, so that promotion can pair this run with
+    # the same local day's check (DESIGN.md 6.4 - promote only a set whose
+    # paired check was PASS). Moving either cron without the other silently
+    # stops monthly promotion.
+    #
+    # One hour is comfortable for a six-minute check but it is not generous:
+    # Actions cron is regularly a few minutes late and occasionally much
+    # later, and if the check has not written its status object by the time
+    # this run reaches promotion, check_status_on finds nothing and the run
+    # promotes nothing. That is self-healing - the next backup retries, and
+    # promotion.no_candidate_alert_days raises it if a month goes by - so the
+    # cost of the tighter gap is an occasional deferred promotion, not a lost
+    # backup.
+    #
+    # ASSUMPTION, NOT CONFIRMED: that 20:00 local is after the end of
+    # business and before the nightly AGOL-to-staging push. The push time is
+    # not recorded anywhere - see DESIGN.md 15 item 15. A run can occupy two
+    # hours, so if the push turns out to be earlier than about 23:00 local
+    # this slot needs moving.
+    - cron: "0 3 * * 2,4,6"
+
+  # The only other trigger. Never pull_request_target: on a public repository
+  # that one DOES pass secrets to a pull request from a fork, and it is the
+  # standard route for exfiltrating them.
+  workflow_dispatch:
+
+# Set explicitly rather than inheriting the organisation default. This job
+# reads the repository and writes to object storage; it needs nothing else,
+# and in particular no write access to the repository itself.
+permissions:
+  contents: read
+
+# One backup at a time, and never cancel one in flight. Two runs would export
+# the same layers twice, race to publish the same dated prefix, and prune
+# against each other's view of what exists. Cancelling mid-run is worse than
+# letting it finish: it would leave a half-populated prefix, which looks
+# complete to a future restore.
+concurrency:
+  group: backup
+  cancel-in-progress: false
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    # Export is slow and its duration is unpredictable. Two real exports on
+    # the same afternoon took 22.6 and 54.5 minutes, with the larger layer
+    # being the faster one, so the cost is AGOL queue time rather than data
+    # volume. backup.export_timeout_minutes caps each export at 90; this is
+    # the outer bound on the whole run, inside the 360-minute job limit.
+    timeout-minutes: 240
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          # arcgis pulls in roughly 70 packages, so an uncached install is
+          # several minutes of the run.
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install --requirement requirements.txt
+
+      - name: Run the backup
+        env:
+          AGO_USERNAME_WINS: ${{ secrets.AGO_USERNAME_WINS }}
+          AGO_PASSWORD_WINS: ${{ secrets.AGO_PASSWORD_WINS }}
+          S3_NRS_ENDPOINT: ${{ secrets.S3_NRS_ENDPOINT }}
+          S3_GSS_GEODRIVE_KEY_ID: ${{ secrets.S3_GSS_GEODRIVE_KEY_ID }}
+          S3_GSS_GEODRIVE_SECRET_KEY: ${{ secrets.S3_GSS_GEODRIVE_SECRET_KEY }}
+        # No shell tracing anywhere in this file. Logs on a public repository
+        # are world readable, and GitHub masks a secret only on an exact
+        # string match - it will not catch one that has been URL-encoded,
+        # split across lines, or embedded in a URL inside an arcgis
+        # traceback. The code reports failures through status.safe_reason for
+        # the same reason; preflight.py is the tool for getting at detail, run
+        # from a machine where the output is private.
+        #
+        # Exits 0 only on PASS with the status object written. A backup run
+        # reaches PASS or SYSTEM_FAIL and nothing else - whether the data is
+        # good is the check job's question, which is why promotion needs a
+        # PASS from that job rather than a successful export from this one.
+        run: python run_backup.py
