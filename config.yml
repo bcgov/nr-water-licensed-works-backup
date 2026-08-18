@@ -380,6 +380,11 @@ notifications:
     SYSTEM_FAIL: [developer]
     stale: [developer]
     prune_paused: [developer]
+    # Not a run status. The backup reports this in the details of a run whose
+    # status is PASS, and PASS routes to nobody, so without this row the
+    # alert that promotion.no_candidate_alert_days asks for reaches no one.
+    # Observed on the first production backup, 2026-08-18. DESIGN.md 8.4.
+    no_monthly_candidate: [developer]
     weekly_summary: [data_owner, shared_inbox, developer]
 
   # A SYSTEM_FAIL lasting this long means backups are not running, which
