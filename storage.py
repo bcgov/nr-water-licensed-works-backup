@@ -25,6 +25,16 @@ from botocore.exceptions import ClientError
 
 logger = logging.getLogger("storage")
 
+# Zero-byte objects the storage backend writes to stand for a folder. This
+# bucket creates one the first time anything is stored under a prefix: both
+# '_$folder$' and 'metrics/_$folder$' appeared on their own the first time the
+# check job wrote a metrics file, having been absent from a listing taken
+# minutes earlier. They are bookkeeping, not artifacts, and a caller that sees
+# one either logs a warning about an unreadable name on every run or - far
+# worse - concludes a tier has already been promoted because something exists
+# under its prefix.
+FOLDER_MARKER_SUFFIX = "_$folder$"
+
 
 @dataclass
 class Storage:
@@ -133,13 +143,20 @@ def list_keys(storage, key_prefix=""):
     ['rotating/2026-08-14/lines.gdb.zip', ...]. Called with no prefix it
     returns everything the project owns and nothing else.
 
-    Two things this has to get right.
+    Three things this has to get right.
 
     The project prefix contains a 0-byte placeholder object whose key *is* the
     prefix, left behind when the folder was created. It is not an artifact,
     and counting it makes every "how many rotating sets are there" answer one
     too many - which is how pruning ends up deleting a set it should have
     kept. Sub-folder placeholders of the same kind end in '/'.
+
+    The backend writes its own folder markers too, named with
+    FOLDER_MARKER_SUFFIX. Those are dropped for the same reason and one
+    sharper one: backup.py decides a monthly or yearly tier has already been
+    promoted by asking whether *anything* exists under its prefix, so a stray
+    marker there would make a month look finished and skip its promotion
+    permanently - silently, in the yearly case.
 
     And list_objects_v2 returns at most 1,000 keys per call without saying so:
     no error, just a short answer. That is the exact shape of failure this
@@ -154,6 +171,8 @@ def list_keys(storage, key_prefix=""):
         for entry in page.get("Contents", []):
             relative = entry["Key"][len(storage.prefix):]
             if not relative or relative.endswith("/"):
+                continue
+            if relative.endswith(FOLDER_MARKER_SUFFIX):
                 continue
             keys.append(relative)
 

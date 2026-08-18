@@ -216,6 +216,24 @@ checks:
 # fail_when: both  -> percent AND absolute must both be exceeded
 # fail_when: any   -> either one is enough
 #
+# null_rate.increase_percent is in percentage POINTS, not a relative
+# change. A field going from 0.1% null to 5.1% null has risen by 5.0.
+#
+# There is no distinct_values rule. DESIGN.md 7.2 proposed one to catch a
+# domain violation on FEATURE_CODE, and measurement on 2026-08-14 showed
+# there is no usable rule to write yet. Lines uses 29 distinct codes
+# against a 15-value domain and points 35 against 10, but the excess is
+# only 263 and 192 features (0.18% and 0.36%), spread across codes
+# carried by a handful of records each - 'EA0610200' and 'EA6100200' are
+# single mistyped records of 'EA06100200'. That is years of accumulated
+# slips rather than an event. A rule on domain membership fails every run
+# forever; a rule on a code appearing since the last check fires on the
+# next typo, at a severity that would pause pruning and block promotion.
+# The distinct values and their per-code counts are recorded in every
+# metrics file instead, as value_counts and values_outside_domain, so the
+# baseline period can decide what a useful rule would look like.
+# The risk this leaves uncovered is in DESIGN.md 7.6.
+#
 # Only FAIL gates the nightly push in Phase 2. WARN alerts and is recorded.
 # ---------------------------------------------------------------------------
 thresholds:
@@ -234,9 +252,19 @@ thresholds:
     zero_features:
       severity: FAIL
     spatial_bins:
+      # min_features is the floor below which a cell is too sparse to
+      # reason about. It is mandatory, not a preference: at 50 km the
+      # lower quartile of populated cells holds 7 features and the
+      # minimum holds 1, so without a floor any legitimate deletion of
+      # a lone feature in a sparse cell raises a FAIL. Across ~300
+      # populated cells that is a daily event, and a check that cries
+      # wolf from the first week is filtered into a folder by the
+      # second. DESIGN.md 7.2.2, requirement 1.
       bin_disappeared:
+        min_features: 20     # PLACEHOLDER
         severity: FAIL
       bin_count_change:
+        min_features: 20     # PLACEHOLDER
         percent: 20          # PLACEHOLDER
         severity: WARN
     extent:
@@ -253,9 +281,7 @@ thresholds:
     null_rate:
       increase_percent: 5    # PLACEHOLDER
       severity: WARN
-    distinct_values:
-      unexpected_value:
-        severity: FAIL
+    # No distinct_values rule - see the note above the thresholds block.
 
   points:
     feature_count:
@@ -271,9 +297,12 @@ thresholds:
     zero_features:
       severity: FAIL
     spatial_bins:
+      # See the note on the lines layer above - the floor is required.
       bin_disappeared:
+        min_features: 20     # PLACEHOLDER
         severity: FAIL
       bin_count_change:
+        min_features: 20     # PLACEHOLDER
         percent: 20          # PLACEHOLDER
         severity: WARN
     extent:
@@ -287,9 +316,7 @@ thresholds:
     null_rate:
       increase_percent: 5    # PLACEHOLDER
       severity: WARN
-    distinct_values:
-      unexpected_value:
-        severity: FAIL
+    # No distinct_values rule - see the note above the thresholds block.
 
 
 # Temporarily suppress rules for a known, approved change - a planned bulk
