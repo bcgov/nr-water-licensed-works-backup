@@ -14,6 +14,12 @@
 // restore path. Recovery is a manual decision made by the data owner.
 
 pipeline {
+    // The GEOBC folder's Jenkins guidance asks that a job name the server it
+    // should run on rather than taking whatever is free. Replace this with the
+    // appropriate agent label once one has been chosen; nothing else in the
+    // file depends on it. A poll needs no particular capability - no arcpy, no
+    // geodatabase, no large workspace - only network reach to object storage
+    // and to the mail relay, and the interpreter named by wlw-notify-python.
     agent any
 
     options {
@@ -41,7 +47,34 @@ pipeline {
         // all - a job that looked once a day could not detect a two-hour
         // delay. Do not slow this down without raising the grace periods to
         // match.
+        //
+        // The GEOBC folder's guidance is to schedule outside working hours,
+        // when servers have capacity, and this runs around the clock. The
+        // reason it is still reasonable: a poll is a handful of object storage
+        // reads and finishes in seconds. No export, no download, no
+        // geodatabase, no CPU and no disk - closer to a health check than to a
+        // scheduled job. If the instance owners still want it slowed, the floor
+        // is 'H H/2 * * *', which is exactly what the two-hour check grace
+        // supports; anything slower means raising schedule.checks_grace_hours
+        // in config.yml and accepting later detection.
         cron('H * * * *')
+    }
+
+    parameters {
+        // Tick this on a manual "Build with Parameters" run to have the job
+        // report what it would send and send nothing. Scheduled builds use the
+        // default and send for real.
+        //
+        // A parameter rather than a setting, because the safety net during the
+        // testing period is not this switch - it is that all three ALERT_*
+        // credentials point at one test address, so a real send goes to one
+        // person and nobody else. This is for reading a message before it goes
+        // out, not for holding the job back.
+        booleanParam(
+            name: 'DRY_RUN',
+            defaultValue: false,
+            description: 'Report what would be sent and send nothing. Writes no state, so it cannot suppress a later real alert.'
+        )
     }
 
     environment {
@@ -53,42 +86,68 @@ pipeline {
         // covered by whatever backs this server up. DESIGN.md 8.5.
         NOTIFY_STATE_FILE = "${JENKINS_HOME}/water-licensed-works/notify-state.json"
 
-        // Which Python runs the job. Set NOTIFY_PYTHON as a global environment
-        // variable on this Jenkins instance to the full path of the interpreter
-        // - on the GIS server that is a clone of the ArcGIS Pro conda
-        // environment with boto3, PyYAML and tzdata already in it. It falls
-        // back to whatever 'python' is on the PATH, which is right for a
-        // developer machine and almost certainly wrong on a server where the
-        // PATH resolves to the stock Pro environment.
-        //
-        // The path lives on the host rather than here because this is a public
-        // repository and internal server layout does not belong in it.
-        //
-        // Calling the interpreter by full path rather than activating the conda
-        // environment is deliberate and safe for this job: boto3, PyYAML and
-        // tzdata are pure Python and need no activation. It would NOT be safe
-        // for anything importing arcpy, which needs the environment activated
-        // for its DLL search path - and nothing here imports arcpy.
-        PYTHON = "${env.NOTIFY_PYTHON ?: 'python'}"
+        NOTIFY_ARGS = "${params.DRY_RUN ? '--dry-run' : ''}"
 
-        // Empty in normal operation. Set NOTIFY_DRY_RUN to 'true' on this
-        // Jenkins instance for the testing period and every build reports what
-        // it would send without sending it.
-        NOTIFY_ARGS = "${env.NOTIFY_DRY_RUN == 'true' ? '--dry-run' : ''}"
+        // EVERY SETTING BELOW COMES FROM THE FOLDER CREDENTIAL STORE, and that
+        // is the one design decision in this file driven by the Jenkins
+        // instance rather than by the project.
+        //
+        // These are per-instance settings, not project settings: an interpreter
+        // path, a mail relay, and one address per notification role. The
+        // natural home for them is Manage Jenkins > System > Global properties,
+        // and it is unavailable - this project has folder-level permissions on
+        // a shared Jenkins and no administrator rights. The folder credential
+        // store is the only per-instance store it can write to, so it holds all
+        // of them, secret or not.
+        //
+        // That is a fair use of it rather than a workaround. None of these
+        // belongs in the repository: this one is public, and internal server
+        // paths and staff addresses do not go in it. Being masked in the
+        // console log is a small bonus.
+        //
+        // The consequence to know about is that masking applies to all of them.
+        // A recipient list prints as **** in the build log, including in the
+        // dry-run report. Read the 'roles' line instead - it names data_owner,
+        // shared_inbox and developer in clear, which is what tells you the
+        // routing is right. Check the addresses themselves in the credential
+        // store.
+        //
+        // Bound here with credentials() rather than in a withCredentials block
+        // so that they reach the post { failure } handler as well as the
+        // stages. That handler mails the developer when this job itself fails,
+        // which is the one failure nothing else in the design covers.
+
+        // The interpreter. A clone of the ArcGIS Pro conda environment, which
+        // this project may not install into (see the environment check stage).
+        //
+        // Called by full path rather than by activating the conda environment,
+        // which is deliberate and safe here: boto3, PyYAML and tzdata are pure
+        // Python and need no activation. It would NOT be safe for anything
+        // importing arcpy, which needs the environment activated for its DLL
+        // search path - and nothing here imports arcpy.
+        PYTHON = credentials('wlw-notify-python')
+
+        // The same object storage key pair the GitHub Actions jobs hold. This
+        // job only ever reads with it - not a permission boundary, because the
+        // bucket issues a single full-access key pair (DESIGN.md 6.6), but a
+        // convention held in notify.py and asserted by tests/test_notify.py.
+        S3_NRS_ENDPOINT = credentials('wlw-s3-endpoint')
+        S3_GSS_GEODRIVE_KEY_ID = credentials('wlw-s3-key-id')
+        S3_GSS_GEODRIVE_SECRET_KEY = credentials('wlw-s3-secret-key')
+
+        // The relay, reachable from this server and from no GitHub runner,
+        // which is the whole reason this job exists here (DESIGN.md 8.1).
+        SMTP_HOST = credentials('wlw-smtp-host')
+        SMTP_SENDER = credentials('wlw-smtp-sender')
+
+        // One per recipient role. config.yml maps each role to the NAME of its
+        // variable and never to an address, so pointing all three at a single
+        // test inbox for the first few days is a change in the credential store
+        // and nowhere else.
+        ALERT_DATA_OWNER = credentials('wlw-alert-data-owner')
+        ALERT_SHARED_INBOX = credentials('wlw-alert-shared-inbox')
+        ALERT_DEVELOPER = credentials('wlw-alert-developer')
     }
-
-    // SMTP_HOST, SMTP_SENDER, ALERT_DATA_OWNER, ALERT_SHARED_INBOX and
-    // ALERT_DEVELOPER are set as global environment variables on this Jenkins
-    // instance (Manage Jenkins > System > Global properties) and are inherited
-    // by every step below. They are deliberately NOT redeclared here: naming
-    // one in this block and assigning it its own value is a way of quietly
-    // overwriting it with an empty string if it happens to be defined at a
-    // different scope, which for a recipient address means an alert sent to
-    // nobody. None of them is in the repository.
-    //
-    // config.yml maps each notification role to the NAME of its variable, so
-    // pointing all three at one inbox for the first few days of testing is a
-    // change on this host and nothing else.
 
     stages {
         stage('Checkout') {
@@ -121,9 +180,10 @@ pipeline {
                 //
                 // If something IS missing and IT cannot add it quickly, the
                 // way out does not touch the shared environment either:
-                // pip install --target into a directory the Jenkins account
-                // owns, and set PYTHONPATH to it as a global environment
-                // variable. Python picks it up with no change to this file.
+                // pip install --target into a directory this account owns, and
+                // put that directory in PYTHONPATH. It would need a binding of
+                // its own in the environment block above, alongside the others,
+                // which is a two-line change if it ever turns out to be needed.
                 //
                 // ZoneInfo is exercised rather than merely imported: Windows
                 // ships no system timezone database, so the constructor is
@@ -134,32 +194,22 @@ pipeline {
                 //
                 // bat because this server is Windows. On a Linux agent both
                 // bat steps become sh and tzdata becomes unnecessary.
-                bat '''"%PYTHON%" -c "import boto3, yaml, zoneinfo; zoneinfo.ZoneInfo('America/Vancouver'); print('boto3, PyYAML and tzdata are all present')" || (echo. & echo The Python named by NOTIFY_PYTHON cannot import something notify.py needs - see jenkins/requirements.txt for the three and why. & echo Do NOT install into that environment. It is on a shared drive, it is used across the organisation, and it belongs to IT. & echo Either raise a request with IT, or pip install --target into a directory this account owns and set PYTHONPATH to it. & exit /b 1)'''
+                bat '''"%PYTHON%" -c "import boto3, yaml, zoneinfo; zoneinfo.ZoneInfo('America/Vancouver'); print('boto3, PyYAML and tzdata are all present')" || (echo. & echo The Python named by the wlw-notify-python credential cannot import something notify.py needs - see jenkins/requirements.txt for the three and why. & echo Do NOT install into that environment. It is on a shared drive, it is used across the organisation, and it belongs to IT. & echo Either raise a request with IT, or pip install --target into a directory this account owns and set PYTHONPATH to it. & exit /b 1)'''
             }
         }
 
         stage('Poll and notify') {
             steps {
-                // Credentials come from the Jenkins credentials store, never
-                // inline and never in the repository. The same S3 key pair the
-                // Actions jobs use; this job only ever reads with it.
-                withCredentials([
-                    string(credentialsId: 's3-nrs-endpoint', variable: 'S3_NRS_ENDPOINT'),
-                    string(credentialsId: 's3-gss-geodrive-key-id', variable: 'S3_GSS_GEODRIVE_KEY_ID'),
-                    string(credentialsId: 's3-gss-geodrive-secret-key', variable: 'S3_GSS_GEODRIVE_SECRET_KEY'),
-                ]) {
-                    // No shell tracing. The console log of a build is visible
-                    // to anyone with access to this server, and an echoed
-                    // command line would put the key in it.
-                    //
-                    // Set NOTIFY_DRY_RUN to 'true' on this Jenkins instance to
-                    // have the job report what it would send and send nothing.
-                    // It is a host setting rather than an edit here so that
-                    // switching it off is not a commit to a public repository
-                    // in the middle of testing. A dry run writes no state
-                    // either, so it cannot suppress the first real alert.
-                    bat '"%PYTHON%" jenkins/notify.py %NOTIFY_ARGS%'
-                }
+                // Everything this needs is already in the environment, bound
+                // from the folder credential store above.
+                //
+                // No shell tracing anywhere in this file. The console log of a
+                // build is visible to anyone with access to this server, and an
+                // echoed command line would put the object storage key in it -
+                // Jenkins masks a credential on an exact string match only, so
+                // it will not catch one that has been re-encoded on the way
+                // into a traceback.
+                bat '"%PYTHON%" jenkins/notify.py %NOTIFY_ARGS%'
             }
         }
     }
@@ -177,6 +227,12 @@ pipeline {
             // Jenkins' own SMTP configuration, not SMTP_HOST - the two are
             // set separately, and this one has to keep working on a build
             // where notify.py never got far enough to read anything.
+            //
+            // Which is also the one thing here that needs an administrator.
+            // Jenkins' global E-mail Notification setting is not something this
+            // project can configure, so if these never arrive, that setting is
+            // empty and it is a request to IT - a small one, and unrelated to
+            // installing anything.
             mail(
                 to: "${env.ALERT_DEVELOPER}",
                 subject: "[Water Licensed Works] The notification job failed - build ${env.BUILD_NUMBER}",
