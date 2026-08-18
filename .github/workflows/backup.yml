@@ -18,36 +18,29 @@ name: Backup
 
 on:
   schedule:
-    # 03:00 UTC Tue/Thu/Sat = 20:00 Mon/Wed/Fri in Vancouver during PDT,
-    # 19:00 during PST.
+    # 04:00 UTC Tue/Thu/Sat = 21:00 Mon/Wed/Fri in Vancouver during PDT,
+    # 20:00 during PST.
     #
     # The UTC days are deliberately one ahead of the local days. A backup at
-    # 20:00 on a Vancouver Monday is already 03:00 Tuesday in UTC, so a cron
+    # 21:00 on a Vancouver Monday is already 04:00 Tuesday in UTC, so a cron
     # of MON/WED/FRI would run on the wrong local evenings. config.yml's
     # schedule.backup_days holds the LOCAL days, because that is what the
     # notify job's expected-slot arithmetic needs; the two are the same
     # schedule written in two timezones and have to be changed together.
     #
-    # One hour after the check slot, so that promotion can pair this run with
-    # the same local day's check (DESIGN.md 6.4 - promote only a set whose
-    # paired check was PASS). Moving either cron without the other silently
-    # stops monthly promotion.
+    # Two hours after the check slot, so that promotion can pair this run
+    # with the same local day's check (DESIGN.md 6.4 - promote only a set
+    # whose paired check was PASS). A check run is about six minutes, so two
+    # hours absorbs an Actions cron delay many times over. Moving either cron
+    # without the other silently stops monthly promotion: check_status_on
+    # simply finds nothing and the run promotes nothing.
     #
-    # One hour is comfortable for a six-minute check but it is not generous:
-    # Actions cron is regularly a few minutes late and occasionally much
-    # later, and if the check has not written its status object by the time
-    # this run reaches promotion, check_status_on finds nothing and the run
-    # promotes nothing. That is self-healing - the next backup retries, and
-    # promotion.no_candidate_alert_days raises it if a month goes by - so the
-    # cost of the tighter gap is an occasional deferred promotion, not a lost
-    # backup.
-    #
-    # ASSUMPTION, NOT CONFIRMED: that 20:00 local is after the end of
+    # ASSUMPTION, NOT CONFIRMED: that 21:00 local is after the end of
     # business and before the nightly AGOL-to-staging push. The push time is
-    # not recorded anywhere - see DESIGN.md 15 item 15. A run can occupy two
-    # hours, so if the push turns out to be earlier than about 23:00 local
-    # this slot needs moving.
-    - cron: "0 3 * * 2,4,6"
+    # not recorded anywhere - see DESIGN.md 15 item 15. This is the tighter
+    # end of the run: a long export can still be uploading at 23:00, so the
+    # push needs to be at midnight or later for this slot to be safe.
+    - cron: "0 4 * * 2,4,6"
 
   # The only other trigger. Never pull_request_target: on a public repository
   # that one DOES pass secrets to a pull request from a fork, and it is the

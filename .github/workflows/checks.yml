@@ -23,11 +23,10 @@ on:
     # status.local_date_stamp, which is what keeps that straight, and is why
     # nothing here passes a date in.
     #
-    # It also runs one hour before the backup slot, so that a backup can find
-    # the same local day's check and promote against it. Moving either cron
-    # without the other breaks monthly promotion. One hour is enough for a
-    # six-minute run with room for Actions being late, but it is tighter than
-    # it looks - see the note on the backup cron.
+    # It also runs two hours before the backup slot, so that a backup can
+    # find the same local day's check and promote against it. Moving either
+    # cron without the other breaks monthly promotion. A run is about six
+    # minutes, so two hours absorbs an Actions cron delay many times over.
     - cron: "0 2 * * *"
 
   # The only other trigger. Never pull_request_target: on a public repository

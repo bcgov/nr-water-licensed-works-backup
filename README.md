@@ -116,14 +116,14 @@ Dependency versions are pinned. These jobs run unattended, and an unpinned depen
 
 | Job | Cadence | Local time |
 |---|---|---|
-| Backup | Monday, Wednesday, Friday — after hours, before the nightly staging push | 20:00 PDT / 19:00 PST |
+| Backup | Monday, Wednesday, Friday — after hours, before the nightly staging push | 21:00 PDT / 20:00 PST |
 | Checks | Daily, evening — after the day's editing, with time to act | 19:00 PDT / 18:00 PST |
 | Notification poll | Hourly | — |
 | Weekly summary | Monday morning | 08:00 |
 
 The cadence settings in `config.yml` and the cron expressions in the workflow files must be kept in step, because the notification job uses the former to decide whether a run is overdue.
 
-GitHub Actions cron is UTC and has no timezone support, so each slot is written in UTC and shifts by an hour across daylight saving. The backup's UTC day-of-week list is deliberately one day ahead of the local one: 20:00 on a Vancouver Monday is already Tuesday in UTC. The check runs an hour before the backup on the same local date, because a backup is promoted to the monthly tier only if that day's check passed.
+GitHub Actions cron is UTC and has no timezone support, so each slot is written in UTC and shifts by an hour across daylight saving. The backup's UTC day-of-week list is deliberately one day ahead of the local one: 21:00 on a Vancouver Monday is already Tuesday in UTC. The check runs two hours before the backup on the same local date, because a backup is promoted to the monthly tier only if that day's check passed.
 
 
 ## Storage layout

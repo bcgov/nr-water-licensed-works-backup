@@ -145,15 +145,14 @@ schedule:
   # UTC and their day-of-week list is deliberately one ahead:
   #
   #   checks.yml   0 2 * * *         02:00 UTC daily       = 19:00 PDT / 18:00 PST
-  #   backup.yml   0 3 * * 2,4,6     03:00 UTC Tue/Thu/Sat = 20:00 PDT / 19:00 PST
+  #   backup.yml   0 4 * * 2,4,6     04:00 UTC Tue/Thu/Sat = 21:00 PDT / 20:00 PST
   #                                                          on Mon/Wed/Fri
   #
-  # 20:00 on a Vancouver Monday is already 03:00 Tuesday in UTC. The two are
+  # 21:00 on a Vancouver Monday is already 04:00 Tuesday in UTC. The two are
   # the same schedule written in two timezones - change them together, and
   # keep the check slot ahead of the backup slot so that promotion can pair
-  # them by local date. The gap is one hour, which is comfortable for a
-  # six-minute check but leaves less room for Actions running late than the
-  # two hours it replaced.
+  # them by local date. The gap is two hours, which absorbs an Actions cron
+  # delay many times over for a six-minute check.
   backup_days: [monday, wednesday, friday]
   checks_daily: true
 
