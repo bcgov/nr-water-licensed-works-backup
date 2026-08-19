@@ -108,15 +108,23 @@ pipeline {
         // so that they reach the post { failure } handler as well as the
         // stages. That handler is the only thing that reports this job failing.
         //
-        // With one gap worth knowing rather than being surprised by: if any
-        // credential below cannot be resolved, the whole block fails and
-        // nothing is bound - including the address the post { failure } handler
-        // needs. Jenkins reports the bare ID of the first one it could not
-        // find, and everything declared above that line resolved fine, which is
-        // usually enough to say what is missing. The post handler prints that
-        // hint rather than throwing a second exception over the first, but the
-        // limit stands: a failure this early is visible as a red build and
-        // nothing more.
+        // EVERY ONE OF THESE MUST BE OF KIND "SECRET TEXT", and the wlw- name
+        // must be typed into the credential's ID field rather than left to
+        // Jenkins, which fills it with a UUID. Both mistakes are easy and only
+        // one of them is loud:
+        //
+        //   wrong ID    -> the build fails with the bare ID, e.g.
+        //                  "ERROR: wlw-s3-endpoint"
+        //   wrong kind  -> a username/password credential binds successfully,
+        //                  but to PYTHON_USR and PYTHON_PSW rather than to
+        //                  PYTHON, so the variable is simply empty and the
+        //                  failure arrives later and reads like something else
+        //
+        // If any binding fails the whole block fails and nothing is bound,
+        // including the address the post { failure } handler needs. That
+        // handler prints a hint rather than throwing a second exception over
+        // the first, but the limit stands: a failure this early is visible as
+        // a red build and nothing more.
 
         // The interpreter. Called by full path rather than by activating a
         // conda environment, which is safe here precisely because everything
@@ -335,11 +343,11 @@ Build: ${env.BUILD_URL}
                     echo(
                         'This build failed before the credentials were bound, ' +
                         'so there is no address to send a failure notice to. ' +
-                        'Look for a bare credential ID in the error above: ' +
-                        'that names the one Jenkins could not resolve, and ' +
-                        'the ones declared before it in the environment block ' +
-                        'resolved fine. Check that it exists in the folder ' +
-                        'credential store and that its kind is Secret text.'
+                        'A bare credential ID in the error above names one ' +
+                        'that could not be resolved. Check every credential ' +
+                        'this job uses: each must be of kind Secret text, and ' +
+                        'the wlw- name must be its ID rather than its ' +
+                        'description or username.'
                     )
                 }
             }
