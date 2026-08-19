@@ -14,12 +14,19 @@
 // restore path. Recovery is a manual decision made by the data owner.
 
 pipeline {
-    // The GEOBC folder's Jenkins guidance asks that a job name the server it
-    // should run on rather than taking whatever is free. Replace this with the
-    // appropriate agent label once one has been chosen; nothing else in the
-    // file depends on it. A poll needs no particular capability - no arcpy, no
-    // geodatabase, no large workspace - only network reach to object storage
-    // and to the mail relay, and the interpreter named by wlw-notify-python.
+    // 'any' is not a default left unconsidered. Agents on this instance are
+    // assigned by the administrators to balance load and are not a job's to
+    // choose, and they are configured identically, so there is no better one
+    // to name. A poll needs no particular capability anyway - no arcpy, no
+    // geodatabase, no large workspace - only network reach and the interpreter
+    // named by wlw-notify-python.
+    //
+    // The consequence worth remembering: THIS JOB CAN RUN ON A DIFFERENT
+    // MACHINE EVERY HOUR. Nothing it needs between polls may live on an
+    // agent's disk, which is why its deduplication state is in object storage
+    // (DESIGN.md 8.5). A state file would have been silently wrong the first
+    // time the scheduler picked a different server, and the symptom would have
+    // been the hourly flood the whole design exists to prevent.
     agent any
 
     options {
