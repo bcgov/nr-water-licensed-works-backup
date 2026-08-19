@@ -69,6 +69,14 @@ storage:
     # inside one so that nobody looking for a restore point finds it.
     notify: notify/
 
+    # The notification job's own code, published here by
+    # publish_notify_code.py on every push to main and downloaded by that job
+    # at the start of every build. It is here because the Jenkins agents that
+    # run it cannot reach github.com and can reach object storage, so the
+    # bucket carries the code to them. Two files and a manifest; not a backup,
+    # and nothing restores from it.
+    code: code/
+
 
 backup:
   # item.export() is asynchronous - it queues a job on AGOL and returns.

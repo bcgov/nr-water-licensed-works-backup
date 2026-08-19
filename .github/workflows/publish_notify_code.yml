@@ -1,0 +1,70 @@
+# Publish the notification job's code to object storage.
+#
+# The Jenkins agents that run jenkins/notify.py cannot reach github.com, and
+# can reach object storage. So the bucket carries the code to them: this
+# workflow uploads jenkins/notify.py and config.yml under the code/ prefix on
+# every push to main that changes either, and the Jenkins job downloads them at
+# the start of every build.
+#
+# The alternative was a clone on a network share that somebody refreshes by
+# hand. That goes stale silently, and a notifier running last month's routing
+# table would send alerts to the wrong people with nothing to say so.
+#
+# This workflow writes only under code/. It touches no backup, no metrics file
+# and no status object, and it never authenticates to ArcGIS Online.
+
+name: Publish notify code
+
+on:
+  push:
+    branches: [main]
+    # Only when something the Jenkins job actually reads has changed. A commit
+    # touching backup.py or the tests does not need a publish.
+    paths:
+      - jenkins/notify.py
+      - config.yml
+      - publish_notify_code.py
+      - .github/workflows/publish_notify_code.yml
+
+  # For republishing by hand after a bucket problem, or to seed the prefix
+  # before the Jenkins job runs for the first time.
+  workflow_dispatch:
+
+# Set explicitly rather than inheriting the organisation default. This job
+# reads the repository and writes to object storage; it needs nothing else.
+permissions:
+  contents: read
+
+# One publish at a time. Two overlapping runs would race to write the same
+# three keys, and the manifest could end up describing the other run's files.
+concurrency:
+  group: publish-notify-code
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # Not requirements.txt. Publishing two small files needs boto3 and
+      # PyYAML, and installing arcgis for it would add several minutes to a
+      # job that runs on every push.
+      - name: Install dependencies
+        run: python -m pip install boto3==1.43.71 PyYAML==6.0.3
+
+      - name: Publish
+        env:
+          S3_NRS_ENDPOINT: ${{ secrets.S3_NRS_ENDPOINT }}
+          S3_GSS_GEODRIVE_KEY_ID: ${{ secrets.S3_GSS_GEODRIVE_KEY_ID }}
+          S3_GSS_GEODRIVE_SECRET_KEY: ${{ secrets.S3_GSS_GEODRIVE_SECRET_KEY }}
+        # No shell tracing. Logs on a public repository are world readable, and
+        # GitHub masks a secret only on an exact string match.
+        run: python publish_notify_code.py
