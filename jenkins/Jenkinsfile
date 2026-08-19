@@ -332,8 +332,11 @@ Build: ${env.BUILD_URL}
                     echo(
                         'This build failed before the credentials were bound, ' +
                         'so there is no address to send a failure notice to. ' +
-                        'The usual cause is the checkout: the agent has to be ' +
-                        'able to reach github.com. See the error above.'
+                        'Look for a bare credential ID in the error above: ' +
+                        'that names the one Jenkins could not resolve, and ' +
+                        'the ones declared before it in the environment block ' +
+                        'resolved fine. Check that it exists in the folder ' +
+                        'credential store and that its kind is Secret text.'
                     )
                 }
             }
