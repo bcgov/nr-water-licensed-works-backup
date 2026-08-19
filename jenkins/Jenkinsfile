@@ -1,41 +1,43 @@
 // Water Licensed Works - hourly notification job.
 //
-// Reads the status objects the GitHub Actions backup and check jobs wrote to
-// object storage, and sends alert mail through the internal SMTP relay. It is
-// on this server because a GitHub-hosted runner cannot reach the relay and
-// this one can - that is the whole of the hybrid design (DESIGN.md 8.1).
+// Reads the status objects that the GitHub Actions backup and check jobs write
+// to object storage, and sends alert mail through an internal SMTP relay. It
+// runs here rather than in Actions for one reason: a GitHub-hosted runner
+// cannot reach that relay, and this host can. Everything else about the
+// pipeline stays in Actions.
 //
-// This job READS object storage and writes nothing to it. It cannot be
-// restricted to that, because the bucket issues a single full-access key pair
-// (DESIGN.md 6.6), so it is a convention held in notify.py and asserted by
+// What it touches:
+//
+//   reads   the status/ prefix in object storage
+//   writes  one object, its own deduplication state, under notify/
+//   sends   mail through the relay
+//
+// It deletes and copies nothing, holds no ArcGIS Online credentials, touches
+// no feature layer, and has no restore path of any kind. The storage
+// credential it holds is not scoped to those prefixes - it cannot be - so that
+// narrow behaviour is a convention held in notify.py and asserted by
 // tests/test_notify.py rather than a permission boundary.
-//
-// It touches no ArcGIS Online layer, holds no AGOL credentials, and has no
-// restore path. Recovery is a manual decision made by the data owner.
 
 pipeline {
-    // 'any' is not a default left unconsidered. Agents on this instance are
-    // assigned by the administrators to balance load and are not a job's to
-    // choose, and they are configured identically, so there is no better one
-    // to name. A poll needs no particular capability anyway - no arcpy, no
-    // geodatabase, no large workspace - only network reach and the interpreter
-    // named by wlw-notify-python.
+    // No agent label, and that is deliberate rather than unconsidered: a poll
+    // needs no particular capability - no arcpy, no geodatabase, no large
+    // workspace - only network reach and the interpreter named below.
     //
     // The consequence worth remembering: THIS JOB CAN RUN ON A DIFFERENT
     // MACHINE EVERY HOUR. Nothing it needs between polls may live on an
-    // agent's disk, which is why its deduplication state is in object storage
-    // (DESIGN.md 8.5). A state file would have been silently wrong the first
-    // time the scheduler picked a different server, and the symptom would have
-    // been the hourly flood the whole design exists to prevent.
+    // agent's disk, which is why its deduplication state is kept in object
+    // storage. A state file would be silently wrong the first time the
+    // scheduler picked a different machine, and the symptom would be an email
+    // every hour - the one failure this job is written to avoid.
     agent any
 
     options {
         // Hourly polling fills a build list quickly. Fifty builds is a little
         // over two days, which is enough to see what happened around an alert
-        // without keeping a month of "nothing to do". DESIGN.md 9.1.
+        // without keeping a month of "nothing to do".
         buildDiscarder(logRotator(numToKeepStr: '50'))
-        // A poll is seconds. Anything past this is an unreachable relay or a
-        // hung connection, and it must not still be running when the next
+        // A poll takes seconds. Anything past this is an unreachable relay or
+        // a hung connection, and it must not still be running when the next
         // hour's build starts.
         timeout(time: 15, unit: 'MINUTES')
         disableConcurrentBuilds()
@@ -43,27 +45,21 @@ pipeline {
 
     triggers {
         // Hourly, at a stable but arbitrary minute rather than on the hour.
-        // 'H' spreads the load instead of joining every other hourly job on
-        // this server at the top of the hour.
+        // 'H' spreads the load instead of joining every other hourly job at
+        // the top of the hour.
         //
-        // Hourly does NOT mean hourly email. The check job writes one status
-        // object a day and notify.py mails only on a change of situation, so
-        // a failure lasting five days is two emails whatever the poll
-        // frequency (DESIGN.md 8.5). What the frequency buys is latency, and
-        // it is what makes schedule.checks_grace_hours of 2 enforceable at
-        // all - a job that looked once a day could not detect a two-hour
-        // delay. Do not slow this down without raising the grace periods to
-        // match.
+        // HOURLY POLLING DOES NOT MEAN HOURLY EMAIL. The check job writes one
+        // status object a day, and notify.py mails only when the situation
+        // changes, so a failure lasting five days produces two messages - one
+        // alert, one resolution - whatever the poll frequency. What the
+        // frequency buys is latency.
         //
-        // The GEOBC folder's guidance is to schedule outside working hours,
-        // when servers have capacity, and this runs around the clock. The
-        // reason it is still reasonable: a poll is a handful of object storage
-        // reads and finishes in seconds. No export, no download, no
-        // geodatabase, no CPU and no disk - closer to a health check than to a
-        // scheduled job. If the instance owners still want it slowed, the floor
-        // is 'H H/2 * * *', which is exactly what the two-hour check grace
-        // supports; anything slower means raising schedule.checks_grace_hours
-        // in config.yml and accepting later detection.
+        // It is also what makes the grace periods in config.yml enforceable.
+        // schedule.checks_grace_hours is 2, and a job that looked once a day
+        // could not detect a two-hour delay at all. Polling every two hours is
+        // the floor; anything slower means raising those grace periods to
+        // match and accepting later detection. Change the two together or not
+        // at all.
         cron('H * * * *')
     }
 
@@ -72,11 +68,10 @@ pipeline {
         // report what it would send and send nothing. Scheduled builds use the
         // default and send for real.
         //
-        // A parameter rather than a setting, because the safety net during the
-        // testing period is not this switch - it is that all three ALERT_*
-        // credentials point at one test address, so a real send goes to one
-        // person and nobody else. This is for reading a message before it goes
-        // out, not for holding the job back.
+        // A parameter rather than a stored setting, because it is for reading
+        // a message before it goes out rather than for holding the job back.
+        // What makes a testing period safe is pointing the ALERT_* credentials
+        // at a test address, so that a real send reaches one person.
         booleanParam(
             name: 'DRY_RUN',
             defaultValue: false,
@@ -88,148 +83,117 @@ pipeline {
         // The deduplication state - what this job last sent mail about, and
         // the thing that turns an hourly poll into occasional email - needs no
         // setting here. It lives in object storage under the project's own
-        // notify/ prefix (DESIGN.md 8.5), which means this job needs no
-        // writable directory on this server, no permission from whoever
-        // administers this Jenkins, and nothing that survives a workspace
-        // wipe. It also means the job keeps working if it lands on a different
-        // agent from one hour to the next, which 'agent any' allows and a
-        // state file on one agent's disk would silently break.
+        // notify/ prefix, so this job needs no writable directory anywhere and
+        // nothing that has to survive a workspace wipe, and it keeps working
+        // when the job lands on a different agent from one hour to the next.
         NOTIFY_ARGS = "${params.DRY_RUN ? '--dry-run' : ''}"
 
-        // EVERY SETTING BELOW COMES FROM THE FOLDER CREDENTIAL STORE, and that
-        // is the one design decision in this file driven by the Jenkins
-        // instance rather than by the project.
+        // EVERY SETTING BELOW COMES FROM THE JENKINS CREDENTIAL STORE.
         //
-        // These are per-instance settings, not project settings: an interpreter
-        // path, a mail relay, and one address per notification role. The
-        // natural home for them is Manage Jenkins > System > Global properties,
-        // and it is unavailable - this project has folder-level permissions on
-        // a shared Jenkins and no administrator rights. The folder credential
-        // store is the only per-instance store it can write to, so it holds all
-        // of them, secret or not.
+        // Some are secrets and some are not. What they have in common is that
+        // they are properties of the machine this runs on rather than of the
+        // project - an interpreter path, a mail relay, one address per
+        // notification role - and that none of them belongs in this
+        // repository, which is public. Internal paths and staff addresses stay
+        // out of it.
         //
-        // That is a fair use of it rather than a workaround. None of these
-        // belongs in the repository: this one is public, and internal server
-        // paths and staff addresses do not go in it. Being masked in the
-        // console log is a small bonus.
+        // One consequence to expect: Jenkins masks anything from the
+        // credential store, so a recipient list prints as **** in the build
+        // log, including in the dry-run report. Read the 'roles' line instead.
+        // It names data_owner, shared_inbox and developer in clear, which is
+        // what tells you the routing is right; the addresses themselves are
+        // checked in the credential store.
         //
-        // The consequence to know about is that masking applies to all of them.
-        // A recipient list prints as **** in the build log, including in the
-        // dry-run report. Read the 'roles' line instead - it names data_owner,
-        // shared_inbox and developer in clear, which is what tells you the
-        // routing is right. Check the addresses themselves in the credential
-        // store.
-        //
-        // Bound here with credentials() rather than in a withCredentials block
+        // Bound with credentials() here rather than in a withCredentials block
         // so that they reach the post { failure } handler as well as the
-        // stages. That handler mails the developer when this job itself fails,
-        // which is the one failure nothing else in the design covers.
+        // stages. That handler is the only thing that reports this job failing.
         //
-        // With one gap that is worth knowing rather than being surprised by:
-        // this block is evaluated AFTER the implicit Declarative: Checkout SCM
-        // stage, so a build that dies during that checkout has no addresses
-        // bound and cannot mail anybody. Seen for real on 2026-08-18, when the
-        // agent could not reach GitHub through the NRS forward proxy. The post
-        // handler now says so in the log rather than throwing a second
-        // exception on top of the first, but the underlying limit stands: a
-        // failure before this point is visible as a red build and nothing
-        // more.
+        // With one gap worth knowing rather than being surprised by: this
+        // block is evaluated after the implicit checkout, so a build that dies
+        // during the checkout has nothing bound and cannot mail anybody. The
+        // post handler says so in the log instead of throwing a second
+        // exception over the first, but the limit stands - a failure that
+        // early is visible as a red build and nothing more.
 
-        // The interpreter. A clone of the ArcGIS Pro conda environment, which
-        // this project may not install into (see the environment check stage).
-        //
-        // Called by full path rather than by activating the conda environment,
-        // which is deliberate and safe here: boto3, PyYAML and tzdata are pure
-        // Python and need no activation. It would NOT be safe for anything
-        // importing arcpy, which needs the environment activated for its DLL
-        // search path - and nothing here imports arcpy.
+        // The interpreter. Called by full path rather than by activating a
+        // conda environment, which is safe here precisely because everything
+        // notify.py imports is pure Python and needs no activation. It would
+        // NOT be safe for anything importing arcpy, which needs its
+        // environment activated for the DLL search path. Nothing here does.
         PYTHON = credentials('wlw-notify-python')
 
-        // The same object storage key pair the GitHub Actions jobs hold. This
-        // job only ever reads with it - not a permission boundary, because the
-        // bucket issues a single full-access key pair (DESIGN.md 6.6), but a
-        // convention held in notify.py and asserted by tests/test_notify.py.
+        // The same object storage key pair the GitHub Actions jobs hold. It is
+        // not scoped and cannot be, so "this job only reads status objects and
+        // writes one state object" is held in notify.py and asserted by
+        // tests/test_notify.py rather than by a permission.
         S3_NRS_ENDPOINT = credentials('wlw-s3-endpoint')
         S3_GSS_GEODRIVE_KEY_ID = credentials('wlw-s3-key-id')
         S3_GSS_GEODRIVE_SECRET_KEY = credentials('wlw-s3-secret-key')
 
-        // The relay, reachable from this server and from no GitHub runner,
-        // which is the whole reason this job exists here (DESIGN.md 8.1).
+        // The relay, which is reachable from this host and from no GitHub
+        // runner - the whole reason this job exists outside Actions.
         SMTP_HOST = credentials('wlw-smtp-host')
         SMTP_SENDER = credentials('wlw-smtp-sender')
 
         // One per recipient role. config.yml maps each role to the NAME of its
         // variable and never to an address, so pointing all three at a single
-        // test inbox for the first few days is a change in the credential store
-        // and nowhere else.
+        // test inbox for the first few days is a change here and nowhere else.
         ALERT_DATA_OWNER = credentials('wlw-alert-data-owner')
         ALERT_SHARED_INBOX = credentials('wlw-alert-shared-inbox')
         ALERT_DEVELOPER = credentials('wlw-alert-developer')
     }
 
-    // There is no checkout stage here on purpose. A declarative pipeline
-    // checks the repository out onto the agent by itself, before the stages
-    // run - that is the 'Declarative: Checkout SCM' stage in the build log -
-    // so an explicit `checkout scm` would simply fetch the same thing twice.
+    // There is no checkout stage below, on purpose. A declarative pipeline
+    // checks the repository out onto the agent by itself before the stages
+    // run, so an explicit `checkout scm` would fetch the same thing twice.
     //
     // That checkout brings config.yml with it, which is the point: the routing
-    // table, the schedule and the grace periods are read from the repository
-    // so that a change to them is reviewable, rather than being edited on this
-    // server where nobody would see it.
+    // table, the schedule and the grace periods are read from the repository,
+    // so a change to any of them is reviewable rather than edited on a server
+    // where nobody would see it.
     //
-    // IT ALSO MEANS THE AGENT NEEDS TO REACH github.com. On 2026-08-18 the
-    // first build failed here: the Jenkins controller fetched the Jenkinsfile
-    // without trouble, and the agent could not reach the NRS forward proxy at
-    // all. Whichever agent this job is pinned to has to be able to reach
-    // GitHub, the NRS object storage endpoint and the SMTP relay - three
-    // requirements that between them decide which server this belongs on.
+    // It also means THE AGENT HAS TO REACH github.com. Along with reaching the
+    // object storage endpoint and the mail relay, that is the whole list of
+    // what this job needs from the machine it runs on.
     stages {
         stage('Check the environment') {
             steps {
-                // This CHECKS the interpreter. NOTHING IN THIS PIPELINE MAY
-                // INSTALL ANYTHING INTO IT, and that is a hard constraint
-                // rather than a preference.
+                // This CHECKS the interpreter and never installs into it.
                 //
-                // The environment is a clone of the ArcGIS Pro conda
-                // environment, it lives on a shared drive, it is used by
-                // hundreds of people across the organisation, and it belongs
-                // to IT. A pip install from here would be an unreviewed change
-                // to everybody's Python, made hourly by a scheduled job. New
-                // packages go through a request to IT.
+                // The interpreter may be a managed environment shared with
+                // other work and not this project's to modify. Installing into
+                // one from a scheduled job would be an unreviewed change to
+                // somebody else's Python, repeated every hour. So the packages
+                // are a prerequisite, listed in jenkins/requirements.txt, and
+                // this stage exists to fail loudly at the top of the build if
+                // they ever stop being available. The alternative is an
+                // ImportError two stages later that reads like a code fault.
                 //
-                // So this stage's whole job is to fail loudly, at the top of
-                // the build, if the environment stops being able to run
-                // notify.py. The alternative is an ImportError two stages
-                // later that reads like a code fault.
+                // If something is missing and cannot be added to that
+                // environment, the way round it leaves the environment alone
+                // too: pip install --target into a directory this account
+                // owns, and put that directory in PYTHONPATH. It would need a
+                // binding of its own above, which is a two-line change.
                 //
-                // If something IS missing and IT cannot add it quickly, the
-                // way out does not touch the shared environment either:
-                // pip install --target into a directory this account owns, and
-                // put that directory in PYTHONPATH. It would need a binding of
-                // its own in the environment block above, alongside the others,
-                // which is a two-line change if it ever turns out to be needed.
+                // ZoneInfo is constructed rather than merely imported, because
+                // that is what actually proves the timezone database is
+                // reachable - Windows ships none of its own - and every
+                // staleness decision notify.py makes is timezone conversion.
                 //
-                // ZoneInfo is exercised rather than merely imported: Windows
-                // ships no system timezone database, so the constructor is
-                // what actually proves tzdata is present, and the
-                // expected-slot arithmetic that stops the Friday-to-Monday
-                // backup gap from false-alarming is entirely timezone
-                // conversion.
-                //
-                // bat because this server is Windows. On a Linux agent both
-                // bat steps become sh and tzdata becomes unnecessary.
-                bat '''"%PYTHON%" -c "import boto3, yaml, zoneinfo; zoneinfo.ZoneInfo('America/Vancouver'); print('boto3, PyYAML and tzdata are all present')" || (echo. & echo The Python named by the wlw-notify-python credential cannot import something notify.py needs - see jenkins/requirements.txt for the three and why. & echo Do NOT install into that environment. It is on a shared drive, it is used across the organisation, and it belongs to IT. & echo Either raise a request with IT, or pip install --target into a directory this account owns and set PYTHONPATH to it. & exit /b 1)'''
+                // bat because this host is Windows. On a Linux agent both bat
+                // steps become sh, and the timezone database is already there.
+                bat '''"%PYTHON%" -c "import boto3, yaml, zoneinfo; zoneinfo.ZoneInfo('America/Vancouver'); print('boto3, PyYAML and tzdata are all present')" || (echo. & echo The Python named by the wlw-notify-python credential cannot import something notify.py needs - jenkins/requirements.txt lists the three and says why. & echo Do not install into that environment if it is shared or managed. & echo Instead, pip install --target into a directory this account owns and set PYTHONPATH to it. & exit /b 1)'''
             }
         }
 
         stage('Poll and notify') {
             steps {
-                // Everything this needs is already in the environment, bound
-                // from the folder credential store above.
+                // Everything this needs is already bound in the environment
+                // above.
                 //
-                // No shell tracing anywhere in this file. The console log of a
-                // build is visible to anyone with access to this server, and an
-                // echoed command line would put the object storage key in it -
+                // No shell tracing anywhere in this file. A build log is
+                // readable by anyone with access to this Jenkins, and an
+                // echoed command line would put the object storage key in it.
                 // Jenkins masks a credential on an exact string match only, so
                 // it will not catch one that has been re-encoded on the way
                 // into a traceback.
@@ -240,35 +204,31 @@ pipeline {
 
     post {
         failure {
-            // The case nothing else covers: the notification job itself
-            // failing. Everything else in this pipeline is detected by
-            // something downstream of it, and this is not - so it goes to the
-            // developer alone, who is the only person able to act on it.
-            // DESIGN.md 8.5.
+            // The one failure nothing else covers: this job itself. Every
+            // other problem in the pipeline is detected by something
+            // downstream of it, and a notifier that has stopped is detected by
+            // nothing - so it goes to the developer, who is the only person
+            // able to act on it.
             //
             // The core `mail` step rather than emailext, so this needs no
-            // plugin beyond what a stock Jenkins already has. It uses
-            // Jenkins' own SMTP configuration, not SMTP_HOST - the two are
-            // set separately, and this one has to keep working on a build
-            // where notify.py never got far enough to read anything.
-            //
-            // Which is also the one thing here that needs an administrator.
-            // Jenkins' global E-mail Notification setting is not something this
-            // project can configure, so if these never arrive, that setting is
-            // empty and it is a request to IT - a small one, and unrelated to
-            // installing anything.
+            // plugin beyond what a stock Jenkins has. It uses Jenkins' own
+            // SMTP configuration rather than SMTP_HOST, deliberately: the two
+            // are configured separately, and this one has to keep working on a
+            // build where notify.py never got far enough to read a setting.
+            // If these never arrive, that Jenkins-level mail configuration is
+            // the thing to check.
             //
             // Guarded, because a build that fails during the implicit checkout
             // never reached the environment block and has no address to send
-            // to. Calling mail with an empty recipient throws, which buries the
-            // real failure under a second stack trace - the opposite of what a
-            // failure handler is for.
+            // to. Calling mail with an empty recipient throws, which buries
+            // the real failure under a second stack trace - the opposite of
+            // what a failure handler is for.
             script {
                 if (env.ALERT_DEVELOPER) {
                     mail(
                         to: "${env.ALERT_DEVELOPER}",
                         subject: "[Water Licensed Works] The notification job failed - build ${env.BUILD_NUMBER}",
-                        body: """The hourly notification job on the GIS server failed.
+                        body: """The hourly notification job failed.
 
 While it is failing, no alert from the backup or check jobs is being
 delivered. Those jobs are unaffected and are still running in GitHub
