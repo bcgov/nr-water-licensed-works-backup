@@ -117,6 +117,16 @@ pipeline {
         // so that they reach the post { failure } handler as well as the
         // stages. That handler mails the developer when this job itself fails,
         // which is the one failure nothing else in the design covers.
+        //
+        // With one gap that is worth knowing rather than being surprised by:
+        // this block is evaluated AFTER the implicit Declarative: Checkout SCM
+        // stage, so a build that dies during that checkout has no addresses
+        // bound and cannot mail anybody. Seen for real on 2026-08-18, when the
+        // agent could not reach GitHub through the NRS forward proxy. The post
+        // handler now says so in the log rather than throwing a second
+        // exception on top of the first, but the underlying limit stands: a
+        // failure before this point is visible as a red build and nothing
+        // more.
 
         // The interpreter. A clone of the ArcGIS Pro conda environment, which
         // this project may not install into (see the environment check stage).
@@ -150,17 +160,23 @@ pipeline {
         ALERT_DEVELOPER = credentials('wlw-alert-developer')
     }
 
+    // There is no checkout stage here on purpose. A declarative pipeline
+    // checks the repository out onto the agent by itself, before the stages
+    // run - that is the 'Declarative: Checkout SCM' stage in the build log -
+    // so an explicit `checkout scm` would simply fetch the same thing twice.
+    //
+    // That checkout brings config.yml with it, which is the point: the routing
+    // table, the schedule and the grace periods are read from the repository
+    // so that a change to them is reviewable, rather than being edited on this
+    // server where nobody would see it.
+    //
+    // IT ALSO MEANS THE AGENT NEEDS TO REACH github.com. On 2026-08-18 the
+    // first build failed here: the Jenkins controller fetched the Jenkinsfile
+    // without trouble, and the agent could not reach the NRS forward proxy at
+    // all. Whichever agent this job is pinned to has to be able to reach
+    // GitHub, the NRS object storage endpoint and the SMTP relay - three
+    // requirements that between them decide which server this belongs on.
     stages {
-        stage('Checkout') {
-            steps {
-                // config.yml comes with it. The routing table, the schedule
-                // and the grace periods are read from the repository so that
-                // a change to them is reviewable, rather than being edited on
-                // this server where nobody would see it.
-                checkout scm
-            }
-        }
-
         stage('Check the environment') {
             steps {
                 // This CHECKS the interpreter. NOTHING IN THIS PIPELINE MAY
@@ -234,10 +250,18 @@ pipeline {
             // project can configure, so if these never arrive, that setting is
             // empty and it is a request to IT - a small one, and unrelated to
             // installing anything.
-            mail(
-                to: "${env.ALERT_DEVELOPER}",
-                subject: "[Water Licensed Works] The notification job failed - build ${env.BUILD_NUMBER}",
-                body: """The hourly notification job on the GIS server failed.
+            //
+            // Guarded, because a build that fails during the implicit checkout
+            // never reached the environment block and has no address to send
+            // to. Calling mail with an empty recipient throws, which buries the
+            // real failure under a second stack trace - the opposite of what a
+            // failure handler is for.
+            script {
+                if (env.ALERT_DEVELOPER) {
+                    mail(
+                        to: "${env.ALERT_DEVELOPER}",
+                        subject: "[Water Licensed Works] The notification job failed - build ${env.BUILD_NUMBER}",
+                        body: """The hourly notification job on the GIS server failed.
 
 While it is failing, no alert from the backup or check jobs is being
 delivered. Those jobs are unaffected and are still running in GitHub
@@ -247,7 +271,16 @@ sent once this is fixed.
 
 Build: ${env.BUILD_URL}
 """
-            )
+                    )
+                } else {
+                    echo(
+                        'This build failed before the credentials were bound, ' +
+                        'so there is no address to send a failure notice to. ' +
+                        'The usual cause is the checkout: the agent has to be ' +
+                        'able to reach github.com. See the error above.'
+                    )
+                }
+            }
         }
     }
 }
