@@ -1013,6 +1013,80 @@ def test_notify_shares_no_imports_with_the_repository():
         assert local not in imported
 
 
+def bootstrap_source():
+    """The fetch script embedded in the Jenkinsfile, pulled back out.
+
+    It is written inline there rather than kept as a file of its own because
+    the Jenkins job runs as a pasted pipeline script with no checkout - so
+    whatever fetches the code has to travel inside the thing being pasted.
+    Extracting it here is what lets it be parsed and held to a contract like
+    any other module.
+    """
+    text = (ROOT / "jenkins" / "Jenkinsfile").read_text(encoding="utf-8")
+    opening = "writeFile file: 'fetch_code.py', text: '''"
+    start = text.index(opening) + len(opening)
+    return text[start:text.index("'''", start)]
+
+
+def bootstrap_wanted():
+    """The bootstrap's published-name -> local-path mapping, read from source."""
+    for node in ast.walk(ast.parse(bootstrap_source())):
+        if isinstance(node, ast.Assign) and any(
+            getattr(target, "id", None) == "WANTED" for target in node.targets
+        ):
+            return {
+                key.value: value.value
+                for key, value in zip(node.value.keys, node.value.values)
+            }
+    raise AssertionError("the Jenkinsfile bootstrap has no WANTED mapping")
+
+
+def test_the_bootstrap_fetches_exactly_what_the_workflow_publishes():
+    """A contract between two files that cannot import each other.
+
+    publish_notify_code.py runs in GitHub Actions and uploads under code/; the
+    bootstrap runs on a Jenkins agent that cannot reach GitHub and downloads
+    from there. Rename a published file on one side only and the notify job
+    stops being able to start - with nothing in the error to say that the two
+    halves disagree about what the object is called.
+
+    Compared as a mapping rather than as a set of names, because the direction
+    is the part that can go wrong: the publisher's local path is the
+    bootstrap's destination, and its published name is the bootstrap's key.
+    """
+    import publish_notify_code
+
+    assert bootstrap_wanted() == {
+        published: local
+        for local, published in publish_notify_code.PUBLISHED_FILES.items()
+    }
+
+    for local_path in publish_notify_code.PUBLISHED_FILES:
+        assert (ROOT / local_path).exists(), local_path
+
+
+def test_the_bootstrap_needs_nothing_from_the_repository():
+    """It runs before anything has been downloaded, so it has to stand alone -
+    boto3 and the standard library, and no import of the code it is fetching."""
+    imported = set()
+    for node in ast.walk(ast.parse(bootstrap_source())):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module.split(".")[0])
+    assert imported - set(sys.stdlib_module_names) == {"boto3"}
+    assert "notify" not in imported
+
+
+def test_the_bootstrap_verifies_what_it_downloaded():
+    """A truncated notify.py fails on import and is obvious. A truncated
+    config.yml can still parse as valid YAML with whole sections missing, which
+    would leave this job routing alerts by an incomplete table."""
+    source = bootstrap_source()
+    assert "sha256" in source
+    assert "manifest" in source
+
+
 def test_the_jenkins_requirements_hold_only_what_that_server_needs():
     lines = (ROOT / "jenkins" / "requirements.txt").read_text(encoding="utf-8").splitlines()
     pinned = [line.split("==")[0] for line in lines if line and not line.startswith("#")]

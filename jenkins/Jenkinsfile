@@ -143,19 +143,25 @@ pipeline {
         ALERT_DEVELOPER = credentials('wlw-alert-developer')
     }
 
-    // There is no checkout stage below, on purpose. A declarative pipeline
-    // checks the repository out onto the agent by itself before the stages
-    // run, so an explicit `checkout scm` would fetch the same thing twice.
+    // THIS PIPELINE NEVER CHECKS THE REPOSITORY OUT, and that is the point of
+    // the fetch stage below.
     //
-    // That checkout brings config.yml with it, which is the point: the routing
-    // table, the schedule and the grace periods are read from the repository,
-    // so a change to any of them is reviewable rather than edited on a server
-    // where nobody would see it.
+    // The agents that run this job cannot reach github.com. They can reach
+    // object storage. So the bucket carries the code to them: a GitHub Actions
+    // workflow publishes notify.py and config.yml under the code/ prefix on
+    // every push to main, and the first stage here downloads them.
     //
-    // It also means THE AGENT HAS TO REACH github.com. Along with reaching the
-    // object storage endpoint and the mail relay, that is the whole list of
-    // what this job needs from the machine it runs on.
+    // Which means this file is pasted into the Jenkins job as an inline
+    // pipeline script rather than read from source control. The copy in the
+    // repository is the canonical one - edit there, review there, then paste.
+    // A change made only in the job configuration is a change nobody can see.
+    //
+    // What the agent needs from its machine is now just two things: reach to
+    // the object storage endpoint, and reach to the mail relay.
     stages {
+        // The environment check runs FIRST, before the fetch. The fetch itself
+        // needs boto3, so an interpreter missing it would fail there with a
+        // traceback about downloading rather than with the sentence below.
         stage('Check the environment') {
             steps {
                 // This CHECKS the interpreter and never installs into it.
@@ -180,9 +186,92 @@ pipeline {
                 // reachable - Windows ships none of its own - and every
                 // staleness decision notify.py makes is timezone conversion.
                 //
-                // bat because this host is Windows. On a Linux agent both bat
-                // steps become sh, and the timezone database is already there.
+                // bat because this host is Windows. On a Linux agent every bat
+                // step becomes sh, and the timezone database is already there.
                 bat '''"%PYTHON%" -c "import boto3, yaml, zoneinfo; zoneinfo.ZoneInfo('America/Vancouver'); print('boto3, PyYAML and tzdata are all present')" || (echo. & echo The Python named by the wlw-notify-python credential cannot import something notify.py needs - jenkins/requirements.txt lists the three and says why. & echo Do not install into that environment if it is shared or managed. & echo Instead, pip install --target into a directory this account owns and set PYTHONPATH to it. & exit /b 1)'''
+            }
+        }
+
+        stage('Fetch the code') {
+            steps {
+                // The bucket and prefix are written out here rather than read
+                // from config.yml, because this is the step that fetches
+                // config.yml. Both are already in the repository in plain
+                // sight; neither is any use without the endpoint and keys,
+                // which are credentials.
+                //
+                // The files land in the layout notify.py expects - itself in
+                // jenkins/, config.yml beside it at the top - so the poll stage
+                // runs exactly the command it would have run after a checkout.
+                //
+                // The manifest is read for two reasons: it names the commit the
+                // code came from, which the build log should say, and it
+                // carries a SHA-256 of each file. A truncated notify.py would
+                // fail on import and be obvious, but a truncated config.yml can
+                // still parse as valid YAML with whole sections missing, which
+                // would leave this job routing alerts by an incomplete table.
+                writeFile file: 'fetch_code.py', text: '''
+"""Download the notification job's code from object storage.
+
+Published by publish_notify_code.py in GitHub Actions on every push to main.
+This runs before anything else in the build, so it uses boto3 and the standard
+library only - nothing from the repository is on disk yet.
+"""
+
+import hashlib
+import json
+import os
+import pathlib
+import sys
+
+import boto3
+
+BUCKET = "gssgeodrive"
+CODE_PREFIX = "authorizations/backups/water_licensed_works/code/"
+
+# Published name -> where it goes in the workspace. The other half of this
+# mapping is PUBLISHED_FILES in publish_notify_code.py, and tests/test_notify.py
+# asserts the two still agree.
+WANTED = {"notify.py": "jenkins/notify.py", "config.yml": "config.yml"}
+
+
+def main():
+    client = boto3.client(
+        "s3",
+        endpoint_url=os.environ["S3_NRS_ENDPOINT"],
+        aws_access_key_id=os.environ["S3_GSS_GEODRIVE_KEY_ID"],
+        aws_secret_access_key=os.environ["S3_GSS_GEODRIVE_SECRET_KEY"],
+    )
+
+    manifest = json.loads(
+        client.get_object(Bucket=BUCKET, Key=CODE_PREFIX + "manifest.json")["Body"].read()
+    )
+
+    for published, destination in sorted(WANTED.items()):
+        path = pathlib.Path(destination)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        client.download_file(BUCKET, CODE_PREFIX + published, str(path))
+
+        expected = manifest["files"][published]
+        actual = hashlib.sha256(path.read_bytes()).hexdigest()
+        if actual != expected:
+            print(
+                f"{published} does not match the checksum in the manifest, so "
+                f"the download is incomplete or the two were published out of "
+                f"step. Re-run the 'Publish notify code' workflow in GitHub "
+                f"Actions and build again."
+            )
+            return 1
+        print(f"fetched {published} to {destination}")
+
+    print(f"code version {manifest['code_version']}, published {manifest['published_utc']}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''
+                bat '"%PYTHON%" fetch_code.py'
             }
         }
 
