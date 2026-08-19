@@ -108,12 +108,15 @@ pipeline {
         // so that they reach the post { failure } handler as well as the
         // stages. That handler is the only thing that reports this job failing.
         //
-        // With one gap worth knowing rather than being surprised by: this
-        // block is evaluated after the implicit checkout, so a build that dies
-        // during the checkout has nothing bound and cannot mail anybody. The
-        // post handler says so in the log instead of throwing a second
-        // exception over the first, but the limit stands - a failure that
-        // early is visible as a red build and nothing more.
+        // With one gap worth knowing rather than being surprised by: if any
+        // credential below cannot be resolved, the whole block fails and
+        // nothing is bound - including the address the post { failure } handler
+        // needs. Jenkins reports the bare ID of the first one it could not
+        // find, and everything declared above that line resolved fine, which is
+        // usually enough to say what is missing. The post handler prints that
+        // hint rather than throwing a second exception over the first, but the
+        // limit stands: a failure this early is visible as a red build and
+        // nothing more.
 
         // The interpreter. Called by full path rather than by activating a
         // conda environment, which is safe here precisely because everything
@@ -307,11 +310,11 @@ if __name__ == "__main__":
             // If these never arrive, that Jenkins-level mail configuration is
             // the thing to check.
             //
-            // Guarded, because a build that fails during the implicit checkout
-            // never reached the environment block and has no address to send
-            // to. Calling mail with an empty recipient throws, which buries
-            // the real failure under a second stack trace - the opposite of
-            // what a failure handler is for.
+            // Guarded, because a build that fails while binding the
+            // environment above has no address to send to. Calling mail with
+            // an empty recipient throws, which buries the real failure under a
+            // second stack trace - the opposite of what a failure handler is
+            // for.
             script {
                 if (env.ALERT_DEVELOPER) {
                     mail(
