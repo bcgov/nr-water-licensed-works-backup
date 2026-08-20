@@ -11,9 +11,18 @@ GitHub-hosted runners cannot reach the relay and the GIS server can, which is
 the whole reason this job exists on a second platform (DESIGN.md 8.1). Actions
 does all the substantive work and writes a status object every run; this job
 reads `status`, looks the recipients up in config.yml, and sends `summary` as
-the body. All judgement stays in checks.py - with one deliberate exception,
-marked where it happens: no_monthly_candidate is reported in the details of a
-run whose status is PASS, and PASS routes to nobody.
+the body. All judgement stays in checks.py - with two deliberate exceptions,
+both marked where they happen. no_monthly_candidate is reported in the details
+of a run whose status is PASS, and PASS routes to nobody. features_outside_bc
+is kept out of the status on purpose, because a status that can never be PASS
+would permanently block promotion to the monthly tier (DESIGN.md 7.6.1), so
+its routing row widens who the run's own email goes to instead.
+
+ONE EMAIL PER RUN, NOT ONE PER KIND OF PROBLEM. Everything a check run found
+travels in that run's own message: the status, the summary, the validity
+findings and the details. A finding was briefly given a message of its own and
+it was the wrong shape - the recipient got two emails about one check, and had
+to put them together to know what the check had said.
 
 ONE WRITE, TO ONE KEY. This job lists and reads under status/, and the only
 thing it writes anywhere is its own deduplication state, to notify/state.json.
@@ -104,23 +113,33 @@ FOLDER_MARKER_SUFFIX = "_$folder$"
 # followed by the second, not an incident clearing.
 RESOLVING_STATUSES = ("WARN", "DATA_FAIL", "SYSTEM_FAIL")
 
-# Two conditions this job has to read out of a status object's details,
-# because neither has a status of its own.
+# Three conditions this job has to read out of a status object's details,
+# because none of them has a status of its own.
 #
-# The first is the exception to "all judgement stays in checks.py" flagged in
-# the module docstring. backup.promote_monthly logs it against a run whose
-# status is PASS, and PASS routes to nobody, so without this the alert that
-# promotion.no_candidate_alert_days has been asking for since the beginning
-# reaches no one - configured, logged, written into the status object and
-# unreachable, which is exactly what happened on the first production backup
-# (DESIGN.md 8.4).
+# The first two are the exception to "all judgement stays in checks.py"
+# flagged in the module docstring. backup.promote_monthly logs the monthly
+# candidate warning against a run whose status is PASS, and PASS routes to
+# nobody, so without this the alert that promotion.no_candidate_alert_days
+# has been asking for since the beginning reaches no one - configured,
+# logged, written into the status object and unreachable, which is exactly
+# what happened on the first production backup (DESIGN.md 8.4).
 #
-# Both strings are a contract with backup.py. If the message there is
-# reworded, reword it here too - tests/test_notify.py builds the real detail
-# lines from backup.py and asserts these still match, so the contract fails a
-# test rather than failing silently in a month's time.
+# The third is there for a stronger reason than routing. checks.py reports a
+# feature that cannot be in British Columbia as a finding rather than as a
+# rule violation, because a violation carries a severity and any permanently
+# non-PASS status permanently blocks monthly promotion - two known-bad
+# records would cost every monthly restore point until somebody corrected
+# them (DESIGN.md 7.6.1). So the status field stays clean and the condition
+# travels in the details, and this is where it is picked back up.
+#
+# All three strings are a contract with the file that writes them. If a
+# message there is reworded, reword it here too - tests/test_notify.py builds
+# the real detail lines from backup.py and checks.py and asserts these still
+# match, so the contract fails a test rather than failing silently in a
+# month's time.
 MONTHLY_CANDIDATE_MARKER = "days in with nothing promoted to the monthly tier"
 PRUNE_PAUSED_MARKER = "pruning paused"
+OUTSIDE_BC_MARKER = "fall outside British Columbia entirely"
 
 # How far back the episode walks read. An episode longer than this is
 # truncated, which is harmless: the walks are only ever asked whether an
@@ -383,9 +402,50 @@ def status_of(record):
 
 
 def reports(record, marker):
-    """Does this run's details carry the marker for one of the two conditions
-    that have no status of their own? See MONTHLY_CANDIDATE_MARKER."""
+    """Does this run's details carry the marker for one of the three
+    conditions that have no status of their own? See MONTHLY_CANDIDATE_MARKER."""
     return any(marker in str(line) for line in record.payload.get("details", []))
+
+
+def outside_bc_lines(record):
+    """The lines checks.py wrote about features outside the province.
+
+    All of them, because there is one per layer and both layers can have
+    them. They are the message as well as the signal, so unlike the other two
+    markers this one wants the text rather than a yes or no.
+    """
+    return [
+        str(line) for line in record.payload.get("details", [])
+        if OUTSIDE_BC_MARKER in str(line)
+    ]
+
+
+def outside_bc_signature(lines):
+    """What the out-of-province situation currently is, as one short string.
+
+    checks.py writes each line as '<layer>: <count> feature(s) fall outside
+    British Columbia entirely - OBJECTID ...', so the layer and the count are
+    the front of it and everything that follows is detail. Reading only those
+    two is what makes a run that names the same records produce no second
+    email, while a third bad record appearing produces one.
+
+    A line this cannot parse is used whole rather than discarded, for the
+    same reason unpromoted_month falls back: a reworded message should still
+    produce one email rather than none, and the line is just as stable while
+    the situation is. tests/test_notify.py builds these lines from checks.py
+    so a rewording that breaks the parse fails a test first.
+    """
+    found = []
+    for line in lines:
+        layer, separator, rest = line.partition(":")
+        # The count is written with thousands separators, as every count in
+        # this project is.
+        count = rest.strip().split(" ", 1)[0].replace(",", "")
+        if separator and layer and count.isdigit():
+            found.append(f"{layer} {int(count)}")
+        else:
+            found.append(line)
+    return ", ".join(sorted(found))
 
 
 def system_fail_episode(history, job):
@@ -571,7 +631,7 @@ def routing_for(config, outcome):
             f"Add one - an empty list means nobody is mailed, which is a "
             f"decision worth writing down rather than arriving at by accident. "
             f"The rows are the five run statuses plus stale, prune_paused, "
-            f"no_monthly_candidate and weekly_summary."
+            f"no_monthly_candidate, features_outside_bc and weekly_summary."
         )
     return list(routing[outcome])
 
@@ -680,28 +740,127 @@ def message_body(paragraphs):
     return "\n\n".join([*kept, FOOTER]) + "\n"
 
 
-def status_notification(config, record):
-    """The alert for one run's status.
+def status_value(run_status, findings):
+    """The dedup value for a status: entry.
 
-    The summary is carried through exactly as checks.py and backup.py wrote
-    it. Both write it for a non-technical reader precisely so that it can be
-    the email body, so rewording or shortening it here would only lose the
-    work (DESIGN.md 8.3).
+    The run status on its own when the check found nothing invalid, which is
+    what it has always been - so every state entry already in the bucket and
+    every count test written for Step 6 compares exactly as before.
+
+    With a finding it also carries what that finding currently is. That is
+    what makes one email go out when the status changes AND one go out when a
+    new bad record appears on a day the status did not move. The second of
+    those is not a nicety: a healthy run is a PASS, PASS routes to nobody, so
+    without it a third bad record on a passing day would reach no one, which
+    is the silence DESIGN.md 7.6.1 was written about.
+    """
+    if not findings:
+        return run_status
+    return f"{run_status} + {outside_bc_signature(findings)}"
+
+
+def status_part(value):
+    """The run status out of a status: value that may also carry a finding.
+
+    Used wherever a recorded value is compared against the five statuses. A
+    status never contains ' + ', so the split is unambiguous.
+    """
+    return str(value).split(" + ", 1)[0]
+
+
+def finding_roles(config, findings):
+    """Who a run's validity findings add to its recipients, if any.
+
+    A finding says a record cannot be right, and only the data owner can
+    correct it, so it widens the list beyond whoever the run status alone
+    would reach. Which matters most on the status that reaches nobody: PASS.
+    """
+    return routing_for(config, "features_outside_bc") if findings else []
+
+
+# What the subject says when a run reports a validity finding. There is one
+# kind of finding today and naming it beats a category word: "data quality
+# findings" told the reader nothing they could act on.
+FINDING_HEADLINE = "features recorded outside British Columbia"
+
+# The statuses that are themselves news. On these the status leads the subject
+# and the finding follows it. On PASS and BASELINE there is no competing
+# headline, so the finding is the whole of it - see status_subject.
+HEADLINE_STATUSES = ("WARN", "DATA_FAIL", "SYSTEM_FAIL")
+
+
+def status_subject(record, run_status, findings):
+    """The subject line for one run's email.
+
+    PASS means "nothing changed since the last run". It does not mean "the
+    data is good" - keeping those two apart is the whole of DESIGN.md 7.6.1 -
+    but nobody reading an inbox knows that, so a subject reading
+    'PASS: daily integrity check, with data quality findings' is a plain
+    contradiction, and a subject that contradicts itself gets the mail filed
+    unread. It said exactly that until 2026-08-19.
+
+    So on a run whose status is not itself news, the finding is the news and
+    leads alone; the status is still in the body, in the run block. On a run
+    that failed, the failure leads and the finding follows it, because a
+    DATA_FAIL must be visibly a DATA_FAIL in an inbox.
+    """
+    label = JOB_LABELS[record.job]
+    if not findings:
+        return f"{SUBJECT_PREFIX} {run_status}: {label}"
+    if run_status in HEADLINE_STATUSES:
+        return f"{SUBJECT_PREFIX} {run_status}: {label}, and {FINDING_HEADLINE}"
+    return f"{SUBJECT_PREFIX} {label.capitalize()}: {FINDING_HEADLINE}"
+
+
+# The context that goes under the summary when a run reports a validity
+# finding. It is here rather than in checks.py because checks.py writes one
+# line for a metrics file and a status object, and this is the part that only
+# makes sense in an email.
+FINDING_PARAGRAPHS = (
+    "A water licensed work cannot be outside the province, so those records "
+    "are wrong wherever they came from, and the OBJECTIDs above are what to "
+    "correct them by.",
+    "This part of the report is not about a change and nothing has happened "
+    "today. Every other rule in the check asks whether the data moved since "
+    "yesterday; this one asks whether it can be right at all, so it appears "
+    "on every run until the records are corrected. It does not affect the "
+    "status above, and it does not stop backups being promoted to the "
+    "monthly tier.",
+    "Correcting the records is the data owner's decision. The backup and "
+    "check pipeline only reads these layers - it has changed nothing, and it "
+    "will keep reporting this until the records are put right or removed.",
+)
+
+
+def status_notification(config, record, findings=()):
+    """The alert for one run's status, and everything else that run found.
+
+    One email per run rather than one per kind of problem. The summary is
+    carried through exactly as checks.py and backup.py wrote it - both write
+    it for a non-technical reader precisely so that it can be the email body,
+    so rewording or shortening it here would only lose the work (DESIGN.md
+    8.3) - and checks.py already puts its validity findings on the end of it.
+
+    So the finding needs no paragraph of its own here, only the context that
+    belongs in an email rather than in a metrics file, and the recipients
+    widened to include whoever would act on it.
     """
     run_status = status_of(record)
     return Notification(
         key=f"status:{record.job}",
-        value=run_status,
-        roles=routing_for(config, run_status),
-        subject=f"{SUBJECT_PREFIX} {run_status}: {JOB_LABELS[record.job]}",
+        value=status_value(run_status, findings),
+        roles=merge_roles(
+            routing_for(config, run_status), finding_roles(config, findings)),
+        subject=status_subject(record, run_status, findings),
         body=message_body([
             record.payload.get("summary", "(the run wrote no summary)"),
+            *(FINDING_PARAGRAPHS if findings else ()),
             run_block(config, record),
         ]),
     )
 
 
-def resolution_notification(config, record, previous, escalated):
+def resolution_notification(config, record, previous, escalated, findings=()):
     """The second of the two emails a five-day incident produces.
 
     It goes to whoever was told about the problem, which is why the state file
@@ -714,22 +873,30 @@ def resolution_notification(config, record, previous, escalated):
     the data owner and the shared inbox that backups had stopped; the original
     alert went to the developer alone, so without this they would be the two
     people never told it was over.
+
+    It records the same composite value a status notification would, because
+    an incident clearing while a validity finding is still open must leave the
+    state describing the finding as well. Recording a bare PASS here would
+    make the next poll see a changed value and send a second email about a
+    situation nobody's inbox has changed.
     """
     roles = merge_roles(
-        previous.get("roles") or routing_for(config, previous["value"]),
+        previous.get("roles") or routing_for(config, status_part(previous["value"])),
         (escalated or {}).get("roles"),
+        finding_roles(config, findings),
     )
     label = JOB_LABELS[record.job]
     return Notification(
         key=f"status:{record.job}",
-        value=status_of(record),
+        value=status_value(status_of(record), findings),
         roles=roles,
         subject=f"{SUBJECT_PREFIX} Resolved: {label}",
         body=message_body([
             f"The {label} is back to {status_of(record)}. "
-            f"The previous alert reported {previous['value']} and nothing "
-            f"further is needed.",
+            f"The previous alert reported {status_part(previous['value'])} and "
+            f"nothing further is needed.",
             record.payload.get("summary", ""),
+            *(FINDING_PARAGRAPHS if findings else ()),
             run_block(config, record),
         ]),
     )
@@ -943,20 +1110,26 @@ def collect_notifications(config, records, history, state, now):
         newest = newest_for(history, job)
         if newest is None or status_of(newest) is None:
             continue
+        # Whatever this run found that is invalid rather than merely changed.
+        # It rides in the run's own email rather than in one of its own, so a
+        # recipient gets one report of what the check found and not two
+        # (DESIGN.md 7.6.1.1). Always empty for the backup job, which measures
+        # nothing about the data.
+        findings = outside_bc_lines(newest)
         previous = state.get(f"status:{job}")
         if (
             previous
-            and previous.get("value") in RESOLVING_STATUSES
+            and status_part(previous.get("value")) in RESOLVING_STATUSES
             and status_of(newest) == "PASS"
         ):
             notifications.append(
                 resolution_notification(
                     config, newest, previous,
-                    state.get(f"escalation:system_fail:{job}"),
+                    state.get(f"escalation:system_fail:{job}"), findings,
                 )
             )
         else:
-            notifications.append(status_notification(config, newest))
+            notifications.append(status_notification(config, newest, findings))
 
         # An empty episode measures zero days, so the emptiness is checked
         # rather than relying on the threshold being above zero.

@@ -9,12 +9,17 @@ would mean hourly email, and DESIGN.md 8.5 answers it in prose; this is the
 same answer as arithmetic, and DESIGN.md 14 makes it an acceptance criterion:
 a failure persisting three days produces one email, not three.
 
-The four ways of getting that wrong all have tests of their own, because each
+The five ways of getting that wrong all have tests of their own, because each
 of them sends the client one email an hour until somebody intervenes:
 
   - a SYSTEM_FAIL escalation re-evaluated as "is it more than three days"
   - the paused-pruning alert, the same shape
   - no_monthly_candidate, which is read from a PASS run's details
+  - features_outside_bc, which is true on every run until somebody edits the
+    data, and is the one condition here that is not about a change at all.
+    It rides in the check run's own email rather than one of its own, so its
+    dedup value is folded into that run's - which is where two of the traps
+    in this file live
   - the weekly summary, which must fire once on a Monday and not 24 times
 
 Staleness has the other flavour of the same bug. Measured as hours since the
@@ -45,6 +50,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "jenkins"))
 
 import backup
+import checks
 import notify
 import storage
 
@@ -492,6 +498,272 @@ def test_the_ordinary_not_promoted_yet_line_is_not_an_alert(sent):
 
 
 # ---------------------------------------------------------------------------
+# features_outside_bc, carried in the check run's own email
+#
+# DESIGN.md 7.6.1 and 7.6.1.1. checks.py keeps this out of its status on
+# purpose, because a status that can never be PASS permanently blocks monthly
+# promotion. That also makes it invisible to the routing table, so the
+# features_outside_bc row widens who the run's own message goes to.
+#
+# One email per run, not one per kind of problem. The dedup value therefore
+# carries both - the status AND what the finding currently is - so mail goes
+# out when either moves, and when neither does, nothing goes out at all.
+# ---------------------------------------------------------------------------
+
+# The lines checks.outside_bc_finding writes for the two records of DESIGN.md
+# 4, and for a third appearing. The contract test at the foot of this file
+# builds them from checks.py rather than trusting these copies.
+OUTSIDE_BC = (
+    "points: 2 feature(s) fall outside British Columbia entirely - "
+    "OBJECTID 150984, 150985."
+)
+OUTSIDE_BC_THIRD = (
+    "points: 3 feature(s) fall outside British Columbia entirely - "
+    "OBJECTID 150984, 150985, 151900."
+)
+
+# What the subject carries when a run reports one. The counts and the
+# OBJECTIDs stay out of it and go in the body, where there is room to say what
+# they mean - and so does the run status on a run that found no change, since
+# "PASS" next to a data problem reads as a contradiction (notify.status_subject).
+FINDINGS_SUBJECT = "outside British Columbia"
+
+
+def test_a_finding_rides_in_the_run_s_own_email(sent):
+    """One email, carrying the status and the finding together. Every
+    production run so far returned BASELINE, which compares nothing, so a
+    finding that waited for a comparison would have said nothing on any of
+    them."""
+    entries = [
+        run("checks", at(day, 2, 6), "BASELINE", details=[OUTSIDE_BC])
+        for day in (18, 19, 20)
+    ]
+    entries += [run("backup", at(day, 4, 40), "PASS") for day in (18, 20)]
+
+    poll_hourly(entries, at(18, 3), at(21, 3))
+
+    alert = only(sent, FINDINGS_SUBJECT)
+    # No status word: BASELINE is not news and would only compete with the
+    # thing the reader can act on. It is still in the body, in the run block.
+    assert alert["subject"] == (
+        f"{notify.SUBJECT_PREFIX} Daily integrity check: "
+        f"features recorded outside British Columbia")
+    assert "BASELINE" not in alert["subject"]
+    assert "Status:  BASELINE" in alert["body"]
+    assert "2 feature(s)" in alert["body"]
+    assert "150984" in alert["body"] and "150985" in alert["body"]
+    # The context that only makes sense in an email, and the sentence that
+    # stops a reader assuming their backups have stopped being promoted.
+    assert "does not stop backups being promoted" in alert["body"]
+    assert "Correcting the records is the data owner's decision" in alert["body"]
+    # The status alone would have reached the developer. The finding widens it
+    # to the people who would correct the records.
+    assert sorted(alert["to"]) == sorted(
+        [ADDRESSES["data_owner"], ADDRESSES["shared_inbox"], ADDRESSES["developer"]]
+    )
+
+
+def test_a_finding_reaches_somebody_on_a_run_that_passed(sent):
+    """The case that decides the whole design. PASS routes to nobody, so a
+    finding carried only by the status would reach no one on any healthy day -
+    and a healthy day is what the project is working towards."""
+    entries = [
+        run("checks", at(day, 2, 6), "PASS", details=[OUTSIDE_BC])
+        for day in (18, 19, 20)
+    ]
+    entries += [run("backup", at(day, 4, 40), "PASS") for day in (18, 20)]
+
+    poll_hourly(entries, at(18, 3), at(21, 3))
+
+    alert = only(sent, FINDINGS_SUBJECT)
+    # And emphatically not "PASS: daily integrity check, with data quality
+    # findings", which is what it said until 2026-08-19. PASS means nothing
+    # moved since yesterday, not that the data is good.
+    assert "PASS" not in alert["subject"]
+    assert ADDRESSES["data_owner"] in alert["to"]
+
+
+def test_an_uncorrected_backlog_is_one_email_and_not_one_a_day(sent):
+    """The objection that kept this a measurement with no rule for as long as
+    it was one: an always-true violation mailing the data owner daily about a
+    backlog nobody is scheduled to fix. The value carries the count, so a week
+    of runs reporting the same two records is one email."""
+    entries = [
+        run("checks", at(day, 2, 6), "PASS", details=[OUTSIDE_BC])
+        for day in range(18, 27)
+    ]
+    entries += [run("backup", at(day, 4, 40), "PASS") for day in (18, 20, 22, 25)]
+
+    poll_hourly(entries, at(18, 3), at(26, 12))
+
+    assert count(sent, FINDINGS_SUBJECT) == 1
+
+
+def test_a_third_bad_record_is_a_second_email(sent):
+    """A new invalid record is worth telling somebody about even while the
+    first two are still there, and even though the run's status has not moved.
+    Two emails, and the second names the third record."""
+    entries = [
+        run("checks", at(day, 2, 6), "PASS", details=[OUTSIDE_BC])
+        for day in (18, 19, 20)
+    ]
+    entries += [
+        run("checks", at(day, 2, 6), "PASS", details=[OUTSIDE_BC_THIRD])
+        for day in (21, 22, 23)
+    ]
+    entries += [run("backup", at(day, 4, 40), "PASS") for day in (18, 20, 22)]
+
+    poll_hourly(entries, at(18, 3), at(24, 3))
+
+    bodies = [
+        message["body"] for message in sent if FINDINGS_SUBJECT in message["subject"]
+    ]
+    assert len(bodies) == 2
+    assert "2 feature(s)" in bodies[0] and "151900" not in bodies[0]
+    assert "3 feature(s)" in bodies[1] and "151900" in bodies[1]
+
+
+def test_a_status_change_while_a_finding_is_open_is_one_email_not_two(sent):
+    """The point of merging. The run goes BASELINE then PASS with the same two
+    records throughout: one email for the finding appearing, one for the status
+    moving, and never two describing the same run."""
+    entries = [
+        run("checks", at(day, 2, 6), "BASELINE", details=[OUTSIDE_BC])
+        for day in (18, 19)
+    ]
+    entries += [
+        run("checks", at(day, 2, 6), "PASS", details=[OUTSIDE_BC])
+        for day in (20, 21, 22)
+    ]
+    entries += [run("backup", at(day, 4, 40), "PASS") for day in (18, 20, 22)]
+
+    poll_hourly(entries, at(18, 3), at(23, 3))
+
+    # Two emails, one per run that reported something new, and never two
+    # about the same run. Neither subject carries a status, so they read the
+    # same and the run block tells them apart.
+    bodies = [
+        message["body"] for message in sent if FINDINGS_SUBJECT in message["subject"]
+    ]
+    assert len(bodies) == 2
+    assert "Status:  BASELINE" in bodies[0]
+    assert "Status:  PASS" in bodies[1]
+
+
+def test_a_clean_run_says_nothing_about_findings(sent):
+    """Lines is expected to hold nothing outside the province, and the quiet
+    case has to stay quiet or the report is worth nothing when it fires. A
+    PASS with no finding routes to nobody, exactly as it always has."""
+    entries = [run("checks", at(day, 2, 6), "PASS") for day in (18, 19, 20)]
+    entries += [run("backup", at(day, 4, 40), "PASS") for day in (18, 20)]
+
+    poll_hourly(entries, at(18, 3), at(21, 3))
+
+    # Nothing in a subject and nothing in a body: a clean check is silent, so
+    # the merged design must not have made a PASS reach anybody.
+    assert count(sent, FINDINGS_SUBJECT) == 0
+    assert not any("British Columbia" in message["body"] for message in sent)
+    assert not any("integrity check" in message["subject"] for message in sent)
+
+
+def test_correcting_the_records_is_quiet_and_a_relapse_alerts_again(sent):
+    """Once corrected the run is an ordinary PASS, which routes to nobody, so
+    nothing is sent - and the state records the bare status, so the same
+    records reappearing is a fresh alert rather than one deduplicated away
+    against a value from months ago."""
+    entries = [
+        run("checks", at(day, 2, 6), "PASS", details=[OUTSIDE_BC]) for day in (18, 19)
+    ]
+    entries += [run("checks", at(day, 2, 6), "PASS") for day in (20, 21)]
+    entries += [
+        run("checks", at(day, 2, 6), "PASS", details=[OUTSIDE_BC]) for day in (22, 23)
+    ]
+    entries += [run("backup", at(day, 4, 40), "PASS") for day in (18, 20, 22)]
+
+    poll_hourly(entries, at(18, 3), at(24, 3))
+
+    assert count(sent, FINDINGS_SUBJECT) == 2
+
+
+def test_both_layers_appear_in_one_email(sent):
+    """One situation, one message. Lines going bad while points already is
+    changes the value, so it is a second email rather than a silent addition
+    to one already sent."""
+    lines_too = "lines: 1 feature(s) fall outside British Columbia entirely - OBJECTID 7788."
+    entries = [
+        run("checks", at(day, 2, 6), "PASS", details=[OUTSIDE_BC]) for day in (18, 19)
+    ]
+    entries += [
+        run("checks", at(day, 2, 6), "PASS", details=[OUTSIDE_BC, lines_too])
+        for day in (20, 21)
+    ]
+    entries += [run("backup", at(day, 4, 40), "PASS") for day in (18, 20)]
+
+    poll_hourly(entries, at(18, 3), at(22, 3))
+
+    bodies = [
+        message["body"] for message in sent if FINDINGS_SUBJECT in message["subject"]
+    ]
+    assert len(bodies) == 2
+    assert "lines:" not in bodies[0]
+    # Both layers, each as its own line, so the OBJECTIDs stay next to the
+    # layer they belong to.
+    assert "lines: 1 feature(s)" in bodies[1]
+    assert "points: 2 feature(s)" in bodies[1]
+
+
+def test_an_incident_clearing_while_a_finding_is_open_sends_one_resolution(sent):
+    """The trap in merging the two. A DATA_FAIL clearing to PASS is a
+    resolution email, and the state it records has to describe the finding as
+    well - recording a bare PASS would make the very next poll see a changed
+    value and send a second email about a situation nobody's inbox has
+    changed."""
+    entries = [
+        run("checks", at(day, 2, 6), "DATA_FAIL", details=[OUTSIDE_BC])
+        for day in (18, 19)
+    ]
+    entries += [
+        run("checks", at(day, 2, 6), "PASS", details=[OUTSIDE_BC])
+        for day in (20, 21, 22)
+    ]
+    entries += [run("backup", at(day, 4, 40), "PASS") for day in (18, 20, 22)]
+
+    poll_hourly(entries, at(18, 3), at(23, 3))
+
+    assert count(sent, "DATA_FAIL") == 1
+    assert count(sent, "Resolved") == 1
+    # And nothing after it. The resolution has to record the finding in its
+    # own state entry: recording a bare PASS would leave the very next poll
+    # seeing a changed value and sending a second email about a situation
+    # nobody's inbox has changed. That extra message is not another
+    # resolution, so counting resolutions alone would miss it.
+    assert count(sent, FINDINGS_SUBJECT) == 1
+
+    # The resolution names the status that was alerting, not the composite
+    # value the state happens to store it under.
+    resolution = only(sent, "Resolved")
+    assert "reported DATA_FAIL and" in resolution["body"]
+    # And the finding is still in front of the reader, because it is still
+    # true - the incident cleared, the invalid records did not.
+    assert "150984" in resolution["body"]
+    assert "does not stop backups being promoted" in resolution["body"]
+
+
+def test_the_dedup_value_is_the_bare_status_when_there_is_no_finding():
+    """Every state entry already in the bucket and every count test written
+    for Step 6 depends on this. A composite value on a clean run would make the
+    first poll after the deploy see a change and mail about it."""
+    assert notify.status_value("PASS", []) == "PASS"
+    assert notify.status_value("DATA_FAIL", ()) == "DATA_FAIL"
+    assert notify.status_value("PASS", [OUTSIDE_BC]) == "PASS + points 2"
+
+    # And it splits back apart wherever a recorded value is compared against
+    # the five statuses.
+    assert notify.status_part("PASS + points 2") == "PASS"
+    assert notify.status_part("DATA_FAIL") == "DATA_FAIL"
+
+
+# ---------------------------------------------------------------------------
 # Staleness, measured from the expected slot
 #
 # DESIGN.md 8.2. Backup slots are local Mon/Wed/Fri at 21:00, which is 04:00
@@ -651,12 +923,13 @@ def test_the_routing_table_drives_recipients_for_all_five_statuses(sent):
 
 
 def test_every_routed_outcome_has_a_row_in_config():
-    """The five statuses plus the four this job raises itself. A missing row
+    """The five statuses plus the five this job raises itself. A missing row
     would present as an alert that was never sent."""
     routing = CONFIG["notifications"]["routing"]
     assert set(routing) == {
         "PASS", "BASELINE", "WARN", "DATA_FAIL", "SYSTEM_FAIL",
-        "stale", "prune_paused", "no_monthly_candidate", "weekly_summary",
+        "stale", "prune_paused", "no_monthly_candidate", "features_outside_bc",
+        "weekly_summary",
     }
     for outcome in routing:
         assert notify.routing_for(CONFIG, outcome) == list(routing[outcome])
@@ -977,6 +1250,69 @@ def test_the_marker_does_not_match_the_ordinary_not_promoted_yet_line():
 
     assert details
     assert not any(notify.MONTHLY_CANDIDATE_MARKER in line for line in details)
+
+
+def test_the_outside_bc_marker_matches_what_checks_py_writes():
+    """The other half of the contract asserted in tests/test_checks.py, built
+    from the real function rather than from a copy of its wording.
+
+    checks.py deliberately keeps this out of its status, so the marker is the
+    only thing that carries it to anybody. A rewording there with no rewording
+    here would silence it again, which is the failure DESIGN.md 7.6.1 exists
+    to have fixed."""
+    finding = checks.outside_bc_finding(
+        "points",
+        {"features_outside_grid": 2, "objectids_outside_grid": [150984, 150985]},
+    )
+    record = notify.StatusRecord(
+        job="checks", moment=at(19, 2, 6), key="status/x.json",
+        payload={"status": "BASELINE", "details": ["compared against nothing", finding]},
+    )
+
+    assert notify.outside_bc_lines(record) == [finding]
+    assert notify.outside_bc_signature([finding]) == "points 2"
+
+
+def test_the_signature_reads_the_count_a_third_record_changes():
+    """The dedup value, and the reason a new bad record is a second email
+    while an unchanged backlog is not."""
+    two, three = (
+        checks.outside_bc_finding("points", {
+            "features_outside_grid": count_outside,
+            "objectids_outside_grid": [150984, 150985, 151900][:count_outside],
+        })
+        for count_outside in (2, 3)
+    )
+    assert notify.outside_bc_signature([two]) == "points 2"
+    assert notify.outside_bc_signature([three]) == "points 3"
+
+
+def test_the_signature_reads_a_count_written_with_thousands_separators():
+    """Counts are written with separators everywhere in this project. A
+    catastrophic reprojection is exactly when the alert must not degrade into
+    the whole line as its own dedup value."""
+    finding = checks.outside_bc_finding(
+        "points", {"features_outside_grid": 53987, "objectids_outside_grid": [1, 2]},
+    )
+    assert notify.outside_bc_signature([finding]) == "points 53987"
+
+
+def test_a_line_the_signature_cannot_parse_still_produces_one_email():
+    """A reworded message should produce one email rather than none, and
+    rather than one an hour. The line itself is stable while the situation
+    is, so it stands in as the value."""
+    reworded = "something fall outside British Columbia entirely, somehow"
+    assert notify.outside_bc_signature([reworded]) == reworded
+
+
+def test_the_outside_bc_finding_is_not_read_from_a_backup_run():
+    """It is the check job that measures this. Reading it from whichever run
+    was newest would report a stale finding on days the check did not run."""
+    record = notify.StatusRecord(
+        job="backup", moment=at(19, 4, 40), key="status/x.json",
+        payload={"status": "PASS", "details": ["published rotating/2026-08-19"]},
+    )
+    assert notify.outside_bc_lines(record) == []
 
 
 def test_the_prune_paused_marker_matches_what_backup_py_writes():

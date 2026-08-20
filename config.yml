@@ -418,6 +418,28 @@ notifications:
     # alert that promotion.no_candidate_alert_days asks for reaches no one.
     # Observed on the first production backup, 2026-08-18. DESIGN.md 8.4.
     no_monthly_candidate: [developer]
+    # NOT A ROW OF ITS OWN EMAIL. These are the people ADDED to the
+    # recipients of a check run's own message when that run reports a feature
+    # whose coordinates place it outside the province.
+    #
+    # The check job reports that as a finding in its details rather than as a
+    # rule violation, because a violation carries a severity and any
+    # permanently non-PASS status permanently blocks promotion to the monthly
+    # tier - the two known bad point records would trade away every monthly
+    # restore point until somebody corrected them (DESIGN.md 7.6.1). Keeping
+    # it out of the status is also what makes it invisible to the routing
+    # above, and this row is what puts it back in front of somebody.
+    #
+    # Set as a data failure is, because that is what it is: the records
+    # belong to Water Authorizations and only the data owner can correct
+    # them, and the message carries the OBJECTIDs precisely so that whoever
+    # reads it can. The cost of widening this way is that while a finding is
+    # open these recipients also see BASELINE and WARN check runs, which the
+    # rows above deliberately keep off them. Status changes are rare, so that
+    # is a handful of emails rather than a stream - but if it is not wanted
+    # during the baseline period, narrow this row to [developer] and nothing
+    # else has to change. Decided 2026-08-19, DESIGN.md 7.6.1.1.
+    features_outside_bc: [data_owner, shared_inbox, developer]
     weekly_summary: [data_owner, shared_inbox, developer]
 
   # A SYSTEM_FAIL lasting this long means backups are not running, which
