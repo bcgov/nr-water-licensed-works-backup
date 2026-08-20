@@ -17,8 +17,13 @@ returning 6,717 rows for a field holding 29 values. A check that silently
 returns garbage is worse than no check, so every rule here has a test with a
 known expected result.
 
-The rules under test are pure - dicts in, Violations out - so nothing here
-touches AGOL, object storage or the network.
+Most of what is under test is pure - dicts in, Violations out. The section at
+the foot of the file runs the whole of run_checks with every boundary replaced
+by a hand-written stand-in, because a validity finding is easiest to lose in
+the wiring rather than in a rule: collected and never put in the details, or
+in the details and never in the metrics file, and in both cases the job goes
+green and says nothing. Nothing here touches AGOL, object storage or the
+network either way.
 """
 
 import ast
@@ -27,10 +32,27 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
 
 import checks
+import storage
+
+
+def load_real_config():
+    """The config.yml the check job will actually read.
+
+    Used by the whole-run tests at the foot of this file, so that the layer
+    names, the thresholds and the suppressions under test are the ones that
+    will run rather than a fixture that could quietly disagree with them.
+    """
+    with open(ROOT / "config.yml", encoding="utf-8") as handle:
+        return yaml.safe_load(handle)
+
+
+REAL_CONFIG = load_real_config()
 
 
 # ---------------------------------------------------------------------------
@@ -439,6 +461,212 @@ def test_the_out_of_domain_backlog_is_still_measured():
 
 
 # ---------------------------------------------------------------------------
+# Validity findings - the one thing reported here that is not a comparison
+#
+# DESIGN.md 7.6.1. Every rule above asks "has this moved?", so the two point
+# records sitting 4,000 km outside BC were measured on every single run and
+# reported by nothing: they predate the first measurement, which makes their
+# drift zero and every change rule silent about them.
+#
+# A finding has to reach the details and must NOT reach the status, because
+# backup.promote_monthly promotes only a set whose paired check returned PASS
+# and these records have been uncorrected since before the project started.
+# ---------------------------------------------------------------------------
+
+# The two records of DESIGN.md 4, verbatim. Identical coordinates roughly
+# 4,000 km outside BC, one data entry error duplicated across two rows, still
+# uncorrected as at 2026-08-19.
+OUTLIERS = {"features_outside_grid": 2, "objectids_outside_grid": [150984, 150985]}
+
+
+def test_the_identifiers_have_to_agree_with_the_count():
+    """They come from two different queries - this list, and inside plus
+    outside against the layer total. Two measurements of the same thing that
+    disagree mean one of them is wrong, and naming records that may not be the
+    offending ones is worse than naming none."""
+    with pytest.raises(RuntimeError, match="one of the two queries is wrong"):
+        checks.checked_outlier_objectids("points", [], 2000)
+    with pytest.raises(RuntimeError, match="No metrics file has been written"):
+        checks.checked_outlier_objectids("points", list(range(2000)), 2)
+
+
+def test_a_feature_edited_during_the_run_is_not_treated_as_a_fault():
+    """These layers are edited through QuickWins while the check is running
+    and the two queries are moments apart, so a feature or two of disagreement
+    is a concurrent edit rather than a malformed query. Same tolerance and
+    same reasoning as everywhere else in this file."""
+    assert checks.checked_outlier_objectids(
+        "points", [150984, 150985], 2 + checks.LIVE_EDIT_TOLERANCE) == [150984, 150985]
+
+
+def test_the_recorded_identifiers_are_capped():
+    """The count is the metric; this is the part a person acts on, and a
+    metrics file written every day is not the place to accumulate an unbounded
+    list."""
+    found = list(range(150900, 150900 + 40))
+    kept = checks.checked_outlier_objectids("points", found, len(found))
+
+    assert kept == found[:checks.MAX_OBJECTIDS_NAMED]
+
+
+def test_the_two_known_records_pass_the_guard_and_are_recorded():
+    """The live reading on points, every run since the first: exactly two,
+    OBJECTID 150984 and 150985 (DESIGN.md 4)."""
+    assert checks.checked_outlier_objectids(
+        "points", [150984, 150985], 2) == [150984, 150985]
+
+
+def test_a_record_outside_bc_is_reported_with_no_history_at_all():
+    """The whole point of a finding. It needs no comparison run, so it is
+    reported on a BASELINE, which is what every run had been so far."""
+    finding = checks.outside_bc_finding("points", metrics(**OUTLIERS))
+
+    assert finding is not None
+    assert "2 feature(s)" in finding
+    # Naming them is most of the value: whoever reads the alert is whoever
+    # would correct the records.
+    assert "150984" in finding and "150985" in finding
+
+
+def test_the_finding_does_not_change_the_run_status():
+    """THE MOST IMPORTANT TEST IN THIS FILE.
+
+    backup.promote_monthly promotes only a set whose paired check returned
+    PASS, so any permanently non-PASS status permanently blocks the monthly
+    tier. Two known records nobody disputes would trade away every monthly
+    restore point for as long as they went uncorrected, which is a worse
+    outcome than the silence this finding exists to end (DESIGN.md 7.6.1).
+
+    The assertion is that the status is exactly what it would have been if
+    the finding did not exist."""
+    outside = metrics(**OUTLIERS)
+    assert checks.outside_bc_finding("points", outside)
+
+    # No rule sees it. The violation list is identical with and without.
+    assert checks.evaluate_layer(
+        "points", outside, metrics(), None, None, LINES_THRESHOLDS) == []
+    assert checks.evaluate_layer(
+        "points", metrics(), metrics(), None, None, LINES_THRESHOLDS) == []
+
+    # So the status is unchanged in both of the cases that matter: the first
+    # run, and every run after it.
+    assert statuses(
+        checks.evaluate_layer("points", outside, None, None, None, LINES_THRESHOLDS),
+        has_comparison=False,
+    ) == "BASELINE"
+    assert statuses(
+        checks.evaluate_layer("points", outside, metrics(), None, None, LINES_THRESHOLDS),
+        has_comparison=True,
+    ) == "PASS"
+
+
+def test_the_finding_is_not_a_violation_and_cannot_quietly_become_one():
+    """A Violation carries a severity, severities reach status_from, and a
+    non-PASS status blocks promotion. Read from the parsed module so that
+    tidying the finding into the rule set fails a test rather than silently
+    emptying the monthly tier."""
+    source = (Path(__file__).resolve().parent.parent / "checks.py").read_text(
+        encoding="utf-8")
+    function = next(
+        node for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.FunctionDef) and node.name == "outside_bc_finding"
+    )
+    constructed = {
+        node.func.id for node in ast.walk(function)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    assert "Violation" not in constructed
+
+
+def test_nothing_outside_bc_produces_nothing():
+    """Lines has never been measured for this and is expected to be clean, so
+    the quiet case is the normal one and must stay quiet."""
+    assert checks.outside_bc_finding("lines", metrics(features_outside_grid=0)) is None
+    # A layer measured before this metric existed, and the zero-feature case
+    # where collection stops early.
+    assert checks.outside_bc_finding("lines", metrics()) is None
+
+
+def test_both_layers_are_checked():
+    """Lines can be outside BC too, and until this was written nothing had
+    ever looked."""
+    finding = checks.outside_bc_finding(
+        "lines", metrics(features_outside_grid=1, objectids_outside_grid=[7788]))
+
+    assert finding.startswith("lines: 1 feature(s)")
+    assert "OBJECTID 7788" in finding
+
+
+def test_the_layer_and_the_count_lead_the_line():
+    """jenkins/notify.py reads both back out of it to decide whether this is
+    the same situation it has already mailed about. tests/test_notify.py holds
+    the other half of that contract."""
+    finding = checks.outside_bc_finding("points", metrics(**OUTLIERS))
+    assert finding.startswith("points: 2 feature(s)")
+
+
+def test_a_third_bad_record_produces_a_different_finding():
+    """Which is what makes it a second email rather than a deduplicated one -
+    the count is the dedup value, so a new bad record is worth telling
+    somebody about and an unchanged one is not."""
+    two = checks.outside_bc_finding("points", metrics(**OUTLIERS))
+    three = checks.outside_bc_finding("points", metrics(
+        features_outside_grid=3, objectids_outside_grid=[150984, 150985, 151900]))
+
+    assert two != three
+    assert "3 feature(s)" in three and "151900" in three
+
+
+def test_the_finding_names_a_handful_and_says_how_many_there_are():
+    """Past a handful the list stops being actionable and starts being a wall
+    of text, the same reasoning as MAX_CELLS_NAMED - but the count has to
+    survive, because 47 bad records and 10 are different emergencies."""
+    named = list(range(150900, 150900 + checks.MAX_OBJECTIDS_NAMED))
+    finding = checks.outside_bc_finding("points", metrics(
+        features_outside_grid=47, objectids_outside_grid=named))
+
+    assert finding.startswith("points: 47 feature(s)")
+    assert f"the first {checks.MAX_OBJECTIDS_NAMED} of 47" in finding
+    assert finding.count("1509") == checks.MAX_OBJECTIDS_NAMED
+
+
+def test_the_count_is_still_reported_when_the_records_could_not_be_named():
+    """The count and the identifiers come from two different queries. If the
+    second returned nothing the first is still worth reporting - saying two
+    features are outside the province beats saying nothing at all."""
+    finding = checks.outside_bc_finding("points", metrics(
+        features_outside_grid=2, objectids_outside_grid=[]))
+
+    assert "2 feature(s)" in finding
+    assert "could not name them" in finding
+
+
+def test_a_large_count_is_still_readable_by_the_notifier():
+    """Counts are written with thousands separators everywhere in this
+    project, and notify.py has to read this one back. A catastrophic
+    reprojection is exactly when the alert must not silently degrade."""
+    finding = checks.outside_bc_finding("points", metrics(
+        features_outside_grid=53987, objectids_outside_grid=[1, 2, 3]))
+
+    assert finding.startswith("points: 53,987 feature(s)")
+
+
+def test_the_finding_reaches_the_summary_that_becomes_the_email_body():
+    """The complaint that started this: the first three production emails said
+    nothing about the two records. A summary that omits a finding restates
+    that silence, and a BASELINE summary otherwise says no verdict on the data
+    is possible - which is exactly what a validity finding disproves."""
+    measurements = {"points": metrics(feature_count=53987, **OUTLIERS)}
+    findings = [checks.outside_bc_finding("points", measurements["points"])]
+
+    baseline = checks.summarise("BASELINE", "2026-08-19", measurements, [], findings)
+    assert "150984" in baseline
+
+    # And the status it is appended to is untouched.
+    assert checks.summarise("BASELINE", "2026-08-19", measurements, [], []) in baseline
+
+
+# ---------------------------------------------------------------------------
 # Status resolution
 # ---------------------------------------------------------------------------
 
@@ -609,6 +837,121 @@ def test_an_empty_suppressions_block_is_fine():
                                                         "2026-09-20")
         assert counted == [VIOLATION]
         assert suppressed == []
+
+
+# ---------------------------------------------------------------------------
+# The whole run, with every boundary replaced by a hand-written stand-in
+#
+# Everything above tests a pure function. That leaves the wiring untested, and
+# the wiring is where a validity finding is easiest to lose: collected and
+# never put in the details, or in the details and never in the metrics file,
+# and in both cases the job goes green and says nothing. Deliberately breaking
+# each of those found no failing test until this section existed.
+#
+# Nothing here touches AGOL, object storage or the network either. The four
+# functions that would are replaced, and what is left is the real run_checks
+# deciding what to do with measurements it is handed.
+# ---------------------------------------------------------------------------
+
+def run_checks_with(monkeypatch, measurements, history=()):
+    """One run against hand-written measurements. Returns the result and the
+    metrics payload it would have written."""
+    written = {}
+
+    def collect(gis, layer_key, layer_config, config):
+        return measurements[layer_key]
+
+    def write(store, config, date_stamp, payload):
+        written.update(payload)
+        return checks.metrics_key(config, date_stamp)
+
+    monkeypatch.setattr(storage, "connect_to_storage", lambda config: "the store")
+    monkeypatch.setattr(checks, "connect_to_agol", lambda config: "the portal")
+    monkeypatch.setattr(checks, "collect_layer_metrics", collect)
+    monkeypatch.setattr(checks, "load_history", lambda store, config, stamp: list(history))
+    monkeypatch.setattr(checks, "monthly_anchor", lambda store, config: (None, None))
+    monkeypatch.setattr(checks, "write_metrics", write)
+
+    return checks.run_checks(REAL_CONFIG), written
+
+
+def outlier_measurements():
+    """Both layers as they actually stand: lines clean, points carrying the
+    two uncorrected records of DESIGN.md 4."""
+    return {
+        "lines": metrics(features_outside_grid=0),
+        "points": metrics(feature_count=53987, **OUTLIERS),
+    }
+
+
+def test_a_baseline_run_reports_the_finding_and_is_still_baseline(monkeypatch):
+    """The run every production check has been so far. It compares nothing,
+    and it must still say the two records are outside the province."""
+    measurements = outlier_measurements()
+    result, written = run_checks_with(monkeypatch, measurements)
+
+    assert result.status == "BASELINE"
+    assert result.failures == []
+
+    finding = checks.outside_bc_finding("points", measurements["points"])
+    # Everywhere a person would look for it: the run's own details, the
+    # metrics file, and the summary that becomes the email body.
+    assert finding in result.details
+    assert written["validity_findings"] == [finding]
+    assert "150984" in result.summary
+
+
+def test_a_run_with_history_and_a_finding_is_still_pass(monkeypatch):
+    """The promotion guard asserted at the level of a whole run.
+    backup.promote_monthly promotes only a set whose paired check returned
+    PASS, so this is the difference between reporting the two records and
+    trading away every monthly restore point to report them."""
+    measurements = outlier_measurements()
+    yesterday = {
+        "date_stamp": "2026-08-18",
+        "status": "PASS",
+        "layers": {layer_key: dict(current) for layer_key, current in measurements.items()},
+    }
+    result, written = run_checks_with(monkeypatch, measurements, history=[yesterday])
+
+    assert result.status == "PASS"
+    assert written["validity_findings"]
+    assert any("British Columbia" in line for line in result.details)
+
+
+def test_a_clean_run_carries_no_finding_at_all(monkeypatch):
+    """Both layers inside the province, which is what the data should look
+    like once the records are corrected."""
+    measurements = {
+        "lines": metrics(features_outside_grid=0),
+        "points": metrics(feature_count=53987, features_outside_grid=0),
+    }
+    result, written = run_checks_with(monkeypatch, measurements)
+
+    assert result.status == "BASELINE"
+    assert written["validity_findings"] == []
+    assert not any("British Columbia" in line for line in result.details)
+    assert "British Columbia" not in result.summary
+
+
+def test_a_finding_on_a_failing_run_reaches_the_details_as_well(monkeypatch):
+    """A data failure and an invalid coordinate are different problems and
+    the first must not swallow the second - the finding is what tells the
+    reader the records were already wrong before today."""
+    measurements = outlier_measurements()
+    yesterday = {
+        "date_stamp": "2026-08-18",
+        "status": "PASS",
+        "layers": {
+            "lines": dict(measurements["lines"]),
+            "points": dict(measurements["points"], feature_count=53987 * 2),
+        },
+    }
+    result, written = run_checks_with(monkeypatch, measurements, history=[yesterday])
+
+    assert result.status == "DATA_FAIL"
+    assert any("British Columbia" in line for line in result.details)
+    assert written["validity_findings"]
 
 
 # ---------------------------------------------------------------------------

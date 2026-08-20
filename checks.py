@@ -15,6 +15,13 @@ truncates a feature, and it holds no restore path of any kind. A failing
 check raises an alert and does nothing else - recovery is a manual decision
 made by the data owner.
 
+One thing it reports is not a comparison at all. A validity finding - a
+feature that could not be right on any day, whatever yesterday looked like -
+is carried in the run's details and never in its status, so that a
+known-bad record cannot block monthly promotion for as long as it goes
+uncorrected. DESIGN.md 7.6.1, and the section comment above
+outside_bc_finding.
+
 Three constraints shape what is here.
 
 run_checks(config) must be importable and callable from outside this
@@ -85,6 +92,13 @@ LIVE_EDIT_TOLERANCE = 5
 # stops being something a person can act on and starts being a wall of text
 # in an email, so the rest are summarised as a count.
 MAX_CELLS_NAMED = 5
+
+# The same idea for the validity finding below, at twice the number. The
+# OBJECTIDs are what the recipient actually works from - they are the whole
+# point of that alert, because whoever reads it is whoever would correct the
+# records - so more of them earns its place where more cell names would not,
+# and ten short integers still fit on one line.
+MAX_OBJECTIDS_NAMED = 10
 
 # groupByFieldsForStatistics returns one row per distinct value, and a null
 # comes back as JSON null. Rendered as this rather than through str(), which
@@ -308,6 +322,50 @@ def count_in_envelope(layer, bounds, wkid, spatial_rel="esriSpatialRelIntersects
     ))
 
 
+def query_objectids_outside_envelope(layer, bounds, wkid):
+    """The OBJECTIDs of the features that fall outside the envelope entirely.
+
+    The count of them is already collected - it is the disjoint half of the
+    grid partition below - and this asks the same question again for the
+    identifiers, because a validity alert that says "2 features are outside
+    British Columbia" is worth much less to the person who would correct them
+    than one that says which two.
+
+    Issued as a raw REST call for the same reason query_value_counts is: the
+    arcgis wrapper has twice now returned a well-formed wrong answer from a
+    query parameter this project depends on, so the parameter that matters
+    here goes to the service directly and the response shape is checked
+    rather than assumed. returnIdsOnly is not subject to maxRecordCount, and
+    the caller compares the number of identifiers against the count it
+    already has, so a short answer cannot pass unnoticed.
+    """
+    envelope = {
+        "xmin": bounds["xmin"], "ymin": bounds["ymin"],
+        "xmax": bounds["xmax"], "ymax": bounds["ymax"],
+        "spatialReference": {"wkid": wkid},
+    }
+    response = layer._con.post(
+        f"{layer.url}/query",
+        {
+            "f": "json",
+            "where": "1=1",
+            "returnIdsOnly": "true",
+            "returnGeometry": "false",
+            "geometry": json.dumps(envelope),
+            "geometryType": "esriGeometryEnvelope",
+            "spatialRel": "esriSpatialRelDisjoint",
+            "inSR": wkid,
+        },
+    )
+    if "objectIds" not in response:
+        raise RuntimeError(
+            f"The disjoint query on {layer.url} returned no objectIds field, "
+            f"so the features outside the grid envelope could not be named. "
+            f"No metrics file has been written."
+        )
+    return sorted(int(object_id) for object_id in response["objectIds"] or [])
+
+
 def grid_cells(grid):
     """The fixed grid, as a list of (cell_id, bounds) pairs.
 
@@ -448,6 +506,35 @@ def assert_grid_partitions_layer(layer, layer_key, spatial_bins, feature_count, 
 # ---------------------------------------------------------------------------
 
 
+def checked_outlier_objectids(layer_key, object_ids, outside):
+    """The identifiers to record for the features outside the grid envelope.
+
+    A known-answer guard, and it is here rather than inside the query above
+    because it is arithmetic and not transport - which also makes it testable
+    against hand-written values, where anything issuing a query is not.
+
+    The identifiers and the count come from two different queries: this list,
+    and inside-plus-outside against the layer total. Two measurements of the
+    same thing that disagree mean one of them is wrong, and a plausible wrong
+    number is the failure this project has hit three times (DESIGN.md 12), so
+    the run stops rather than naming records that may not be the offending
+    ones. The tolerance is the usual one - these layers are edited while the
+    check is running and the two queries are moments apart.
+
+    Only as many as an alert will name are kept. The count is the metric; this
+    is the part a person acts on, and a metrics file is not the place to
+    accumulate an unbounded list.
+    """
+    if abs(len(object_ids) - outside) > LIVE_EDIT_TOLERANCE:
+        raise RuntimeError(
+            f"The {layer_key} disjoint query counted {outside:,} features "
+            f"outside the grid envelope but named {len(object_ids):,} of them. "
+            f"Too large a gap to be editing during the run, so one of the two "
+            f"queries is wrong. No metrics file has been written."
+        )
+    return object_ids[:MAX_OBJECTIDS_NAMED]
+
+
 def collect_layer_metrics(gis, layer_key, layer_config, config):
     """Every measurement for one layer, all from live queries.
 
@@ -539,6 +626,22 @@ def collect_layer_metrics(gis, layer_key, layer_config, config):
     metrics["spatial_bins_populated"] = len(metrics["spatial_bins"])
     metrics["features_inside_grid"] = inside
     metrics["features_outside_grid"] = outside
+
+    # Which ones. Queried only when there are any, because the answer is
+    # normally none on lines and the two records of DESIGN.md 4 on points, and
+    # a query that returns nothing is not worth issuing 364 days a year.
+    metrics["objectids_outside_grid"] = []
+    if outside:
+        metrics["objectids_outside_grid"] = checked_outlier_objectids(
+            layer_key,
+            query_objectids_outside_envelope(layer, grid, grid["wkid"]),
+            outside,
+        )
+        logger.warning(
+            "%s: %s feature(s) fall outside the grid envelope entirely - "
+            "OBJECTID %s", layer_key, f"{outside:,}",
+            ", ".join(str(object_id) for object_id in metrics["objectids_outside_grid"]),
+        )
 
     logger.info(
         "%s: %s features, %d populated cells, %d value(s) outside the domain",
@@ -1037,6 +1140,76 @@ def evaluate_layer(layer_key, current, previous, trend, anchor, thresholds):
 
 
 # ---------------------------------------------------------------------------
+# Validity findings
+#
+# NOT RULES, AND DELIBERATELY NOT VIOLATIONS.
+#
+# Every rule above asks "has this moved?". A finding asks "is this valid?" -
+# a question with an answer on the first run, before there is anything to
+# compare against, and with the same answer on the four hundredth. DESIGN.md
+# 7.6.1 records how that gap was found: the two point records sitting 4,000
+# km outside BC (DESIGN.md 4) are measured on every single run and were
+# reported by nothing, because they predate every measurement and so drift
+# is zero.
+#
+# A finding is a plain string and never a Violation, and that is the whole
+# design rather than a shortcut. Violations carry a severity, severities
+# reach status_from, and any permanently non-PASS status permanently blocks
+# monthly promotion (backup.promote_monthly). Two known records nobody
+# disputes would then cost every monthly restore point for as long as they
+# went uncorrected, which is a worse outcome than the silence being fixed
+# here. So a finding travels in the run's details with its own routing row in
+# config.yml, exactly as no_monthly_candidate does, and reaches the people
+# who would act on it without touching the status.
+#
+# If a severity is ever added to one of these, monthly promotion stops. There
+# is a test for that in tests/test_checks.py, and it is the most important one
+# in the set.
+# ---------------------------------------------------------------------------
+
+
+def outside_bc_finding(layer_key, current):
+    """The features that cannot be in British Columbia, as one line, or None.
+
+    The bound is the grid envelope in checks.spatial_grid and is deliberately
+    not a second envelope of its own. The count being reported here is the
+    disjoint half of the grid partition, so it arrives already carrying its
+    own arithmetic proof - inside plus outside equals the live feature count,
+    asserted on every pass - where a separate validity envelope would be a
+    fresh unguarded number of exactly the shape this project has been bitten
+    by three times. The grid envelope is also the one value in config.yml
+    that already carries a written warning against tuning it, which is the
+    right property for a validity bound to have. Reasoning at DESIGN.md 7.6.1.
+
+    It is generous by 25 to 75 km on every side of the province, so a feature
+    outside it is not near a border and is not arguable.
+
+    Both layers. Nothing had ever looked at lines, which is its own reason to.
+    """
+    outside = current.get("features_outside_grid")
+    if not outside:
+        return None
+
+    object_ids = current.get("objectids_outside_grid") or []
+    named = ", ".join(str(object_id) for object_id in object_ids)
+    if not named:
+        which = "and this run could not name them"
+    elif outside > len(object_ids):
+        which = f"OBJECTID {named} (the first {len(object_ids)} of {outside:,})"
+    else:
+        which = f"OBJECTID {named}"
+
+    # The layer and the count lead the line, and jenkins/notify.py reads both
+    # back out of it to decide whether this is the same situation it has
+    # already mailed about. That parse is a contract between the two files and
+    # tests/test_notify.py builds this line from here to prove it holds.
+    return (
+        f"{layer_key}: {outside:,} feature(s) fall outside British Columbia "
+        f"entirely - {which}."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Suppressions and status
 # ---------------------------------------------------------------------------
 
@@ -1126,33 +1299,56 @@ def status_from(violations, has_comparison):
     return "PASS"
 
 
-def summarise(status, date_stamp, metrics, violations):
-    """One line for a non-technical reader, which becomes the email body."""
+def summarise(status, date_stamp, metrics, violations, findings=()):
+    """One line for a non-technical reader, which becomes the email body.
+
+    A validity finding is appended whatever the status is, PASS and BASELINE
+    included, and does not change it. It is the one thing reported here that
+    needs no earlier run to be true, so leaving it out of a summary that says
+    "no verdict is possible until the next run" would restate the silence
+    DESIGN.md 7.6.1 was written about.
+    """
     counts = " and ".join(
         f"{layer_metrics.get('feature_count', 0):,} {layer_key}"
         for layer_key, layer_metrics in metrics.items()
     )
 
     if status == "BASELINE":
-        return (
+        text = (
             f"First integrity check, {date_stamp}. The layers hold {counts}, "
             f"recorded as the starting point for future comparisons. There is "
             f"nothing earlier to compare against yet, so no verdict on the data "
             f"is possible until the next run."
         )
-    if status == "PASS":
-        return (
-            f"Integrity check passed for {date_stamp}. The layers hold {counts}, "
-            f"in line with recent runs."
+    elif status == "PASS":
+        # "found no unexpected change" rather than "passed", because passed is
+        # what a PASS is not. The status answers "has this moved?" and nothing
+        # else, so a summary claiming the check passed sits badly next to a
+        # validity finding appended below - and worse, it overclaims even when
+        # there is no finding. DESIGN.md 7.6.1.
+        text = (
+            f"The integrity check found no unexpected change for {date_stamp}. "
+            f"The layers hold {counts}, in line with recent runs."
         )
+    else:
+        ranked = [v for v in violations if v.severity == "FAIL"] or violations
+        headline = ranked[0].message
+        others = len(violations) - 1
+        tail = f" ({others} other issue(s) were found - see the details.)" if others else ""
+        if status == "DATA_FAIL":
+            text = f"{headline}{tail} The backups are untouched and no data has been changed."
+        else:
+            text = f"{headline}{tail}"
 
-    ranked = [v for v in violations if v.severity == "FAIL"] or violations
-    headline = ranked[0].message
-    others = len(violations) - 1
-    tail = f" ({others} other issue(s) were found - see the details.)" if others else ""
-    if status == "DATA_FAIL":
-        return f"{headline}{tail} The backups are untouched and no data has been changed."
-    return f"{headline}{tail}"
+    if findings:
+        # Worded to sit correctly after either sentence above. BASELINE says
+        # no verdict is possible until there is something to compare against,
+        # and PASS says nothing changed; a validity finding is the exception
+        # to both, and has to read as one rather than as a contradiction.
+        text += (
+            " Separately, and needing no comparison to be true - " + " ".join(findings)
+        )
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -1296,8 +1492,20 @@ def run_checks(config):
             [], [reason], {}, date_stamp, code_version,
         )
 
+    # Deliberately outside the violation list and outside status_from. A
+    # finding says the data is invalid, not that it changed, and it must not
+    # gate monthly promotion - see the section comment above
+    # outside_bc_finding.
+    findings = []
+    for layer_key, current in measurements.items():
+        finding = outside_bc_finding(layer_key, current)
+        if finding:
+            logger.warning("%s", finding)
+            findings.append(finding)
+
     status = status_from(violations, has_comparison=previous is not None)
     details.extend(violation.message for violation in violations)
+    details.extend(findings)
     details.extend(f"suppressed: {violation.message}" for violation in suppressed)
 
     metrics = {
@@ -1311,6 +1519,7 @@ def run_checks(config):
         "previous_metrics_file": metrics_key(config, previous_stamp) if previous_stamp else None,
         "monthly_anchor_file": anchor_key,
         "trend_window_runs": len(history),
+        "validity_findings": findings,
         "failures": [
             {"layer": v.layer, "rule": v.rule, "severity": v.severity,
              "comparison": v.comparison, "message": v.message}
@@ -1344,7 +1553,7 @@ def run_checks(config):
     logger.info("%s for %s, %d rule(s) broken", status, date_stamp, len(violations))
     return CheckResult(
         status,
-        summarise(status, date_stamp, measurements, violations),
+        summarise(status, date_stamp, measurements, violations, findings),
         [violation.message for violation in violations],
         details,
         metrics,
