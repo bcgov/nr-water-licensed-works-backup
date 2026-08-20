@@ -27,11 +27,44 @@ Restore procedures are documented runbooks carried out by a person. Any tooling 
 
 ## How it works
 
+```mermaid
+flowchart TD
+  SRC["Water Licensed Works<br/>lines and points, in ArcGIS Online"]
+
+  SRC -->|read only| BK["Backup<br/>Mon, Wed, Fri"]
+  SRC -->|read only| CK["Integrity check<br/>every day"]
+
+  subgraph STORE["Secure backup storage"]
+    R["Recent copies<br/>last 8, and none deleted<br/>while a serious problem is open"]
+    M["Monthly copies<br/>last 12"]
+    Y["Yearly copies<br/>kept indefinitely"]
+    R -->|"unless the check that day found a serious problem"| M
+    M -->|first one of each year| Y
+  end
+
+  BK -->|"every run, whatever the check finds"| R
+
+  CK --> MEAS["Measures both layers<br/>how many features, how far they spread,<br/>how they sit across a 50 km grid,<br/>field structure, empty fields, works-type codes"]
+  MEAS --> CMP["Compares every measurement against<br/>yesterday, the last 30 days, and the monthly archive"]
+  CMP --> VER["One verdict for the day, plus anything that<br/>cannot be right at all, such as a feature outside BC"]
+
+  BK --> REC[("Result of every run")]
+  VER --> REC
+
+  REC --> W["Hourly watch<br/>also notices a run that should have happened and did not"]
+
+  W -->|"a data problem, or a record that cannot be right,<br/>plus a summary every Monday whatever happened"| CLIENT["Data owner<br/>Water business inbox<br/>GeoBC"]
+  W -->|"a technical fault, or nothing to act on yet"| GEO["GeoBC only"]
+  W -->|"nothing has changed since the last email"| NONE["No email"]
+```
+
 **Backup** runs Monday, Wednesday and Friday. It exports each layer to a file geodatabase, validates the downloaded artifact, writes a manifest and a copy of the service definition, uploads everything under a new date-stamped prefix, and only then prunes anything old. A failure at any point leaves the previous backup set untouched.
 
 File geodatabase is used because it preserves field types, nulls, coded-value domains and subtypes. It does not capture hosted service configuration — item ID, sharing, symbology, sync settings — which is why the documented restore path preserves the existing hosted item rather than replacing it.
 
-**Checks** run daily. They collect dataset-level metrics from live queries — feature count, extent, centroid, spatial bin distribution, total length, schema fingerprint, null rates, distinct coded values — and compare each against the previous run, a rolling 30-day median, and the most recent monthly baseline. The result is one of `PASS`, `BASELINE`, `WARN`, `DATA_FAIL` or `SYSTEM_FAIL`.
+**Checks** run daily. They collect dataset-level metrics from live queries — feature count, extent, spatial bin distribution over a fixed 50 km grid, total length, schema fingerprint, null rates, distinct coded values — and compare each against the previous run, a rolling 30-day median, and the most recent monthly baseline. The result is one of `PASS`, `BASELINE`, `WARN`, `DATA_FAIL` or `SYSTEM_FAIL`.
+
+Every one of those rules asks whether something *changed*. A separate class of finding asks whether the data can be right at all — a feature whose coordinates place it outside British Columbia is wrong on the first run and on the four hundredth, and no comparison will ever show it. Findings are reported in the run's details and never in its status, so a known-bad record raises an alert without blocking anything for as long as it goes uncorrected.
 
 `DATA_FAIL` and `SYSTEM_FAIL` are kept distinct on purpose. An authentication failure or storage timeout is an operational problem, not a data anomaly; it alerts just as loudly, but it must never be allowed to block the nightly push for reasons unrelated to data quality.
 
@@ -129,7 +162,7 @@ Dependency versions are pinned. These jobs run unattended, and an unpinned depen
 
 The cadence settings in `config.yml` and the cron expressions in the workflow files must be kept in step, because the notification job uses the former to decide whether a run is overdue.
 
-GitHub Actions cron is UTC and has no timezone support, so each slot is written in UTC and shifts by an hour across daylight saving. The backup's UTC day-of-week list is deliberately one day ahead of the local one: 21:00 on a Vancouver Monday is already Tuesday in UTC. The check runs two hours before the backup on the same local date, because a backup is promoted to the monthly tier only if that day's check passed.
+GitHub Actions cron is UTC and has no timezone support, so each slot is written in UTC and shifts by an hour across daylight saving. The backup's UTC day-of-week list is deliberately one day ahead of the local one: 21:00 on a Vancouver Monday is already Tuesday in UTC. The check runs two hours before the backup on the same local date, because promotion to the monthly tier depends on that day's check outcome.
 
 
 ## Storage layout
@@ -137,15 +170,17 @@ GitHub Actions cron is UTC and has no timezone support, so each slot is written 
 ```
 <bucket>/<project prefix>/
     rotating/   2026-08-12/   lines.gdb.zip  points.gdb.zip  manifest.json  servicedef.json
-    monthly/    2026-08/      promoted copy of a rotating set that passed its checks
+    monthly/    2026-08/      promoted copy of a rotating set whose check did not fail
     yearly/     2026/         promoted copy of a monthly set; never pruned automatically
     metrics/    2026-08-12.json
     status/     checks-2026-08-14T23:05:00Z.json
 ```
 
-Monthly and yearly artifacts are **promoted**, not re-exported — a server-side copy of a set that has already been validated and has passed its data checks. Re-exporting would produce a different snapshot, and would add low-frequency scheduled jobs that fail silently.
+Monthly and yearly artifacts are **promoted**, not re-exported — a server-side copy of a set that has already been validated and whose data check did not report a failure. Re-exporting would produce a different snapshot, and would add low-frequency scheduled jobs that fail silently.
 
-Promotion deliberately requires a passing data check rather than merely a valid artifact. Artifact validation proves the file is intact; a faithful snapshot of corrupt data passes it cleanly. Without that rule, corrupt data could become the monthly baseline that every subsequent comparison is measured against.
+Promotion deliberately depends on the data check, not merely on a valid artifact. Artifact validation proves the file is intact; a faithful snapshot of corrupt data passes it cleanly. Without that rule, corrupt data could become the monthly baseline that every subsequent comparison is measured against.
+
+Only a `DATA_FAIL` blocks it. A `WARN` is below the action threshold by definition, and a lesser data issue can go uncorrected for weeks — refusing to archive for that long would cost the month its copy over something nobody was acting on. The eligible outcomes are `promotion.promote_on` in `config.yml`.
 
 The bucket is shared with other projects. Everything this project reads, writes, lists or deletes lives under its own prefix.
 
