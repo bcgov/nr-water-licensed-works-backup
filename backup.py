@@ -458,15 +458,22 @@ def latest_check_status(store, config):
 
 
 def promote_monthly(store, config, date_stamp, details):
-    """Promote the month's first checked rotating set to the monthly tier.
+    """Promote the month's first eligible rotating set to the monthly tier.
 
     The rule is the first rotating set of the calendar month whose paired
-    check status was PASS - not merely the first set with a valid artifact.
-    Artifact validation proves the zip is intact; a faithful snapshot of
-    corrupt data passes it cleanly. Promoting on that basis would make
-    corrupt data the monthly anchor that the check job's comparison is
-    measured against for the rest of the month, so the reference for "normal"
-    would itself be wrong.
+    check outcome is one of promotion.promote_on - not merely the first set
+    with a valid artifact. Artifact validation proves the zip is intact; a
+    faithful snapshot of corrupt data passes it cleanly. Promoting on that
+    basis would make corrupt data the monthly anchor that the check job's
+    comparison is measured against for the rest of the month, so the
+    reference for "normal" would itself be wrong.
+
+    What that list holds is a judgement rather than a mechanism, so it lives
+    in config.yml with the reasoning next to it. In short: only a verdict
+    that the data is wrong blocks the archive. It was PASS alone until
+    2026-08-19, which also refused a WARN - a severity defined as below the
+    action threshold, and one that can persist for weeks against the 30-day
+    median after a single legitimate bulk load.
 
     A copy, not a second export: exporting again would produce a different
     snapshot taken at a different moment.
@@ -474,7 +481,7 @@ def promote_monthly(store, config, date_stamp, details):
     month = date_stamp[:7]
     monthly_path = config["storage"]["paths"]["monthly"]
     rotating_path = config["storage"]["paths"]["rotating"]
-    require_pass = config["promotion"]["require_check_pass"]
+    promote_on = config["promotion"]["promote_on"]
 
     if storage.list_keys(store, f"{monthly_path}{month}/"):
         details.append(f"monthly/{month} was already promoted")
@@ -484,20 +491,26 @@ def promote_monthly(store, config, date_stamp, details):
         if not set_name.startswith(month):
             continue
         status = check_status_on(store, config, set_name)
-        if status == "PASS" or not require_pass:
+        if status in promote_on:
             copy_set(store, f"{rotating_path}{set_name}/", f"{monthly_path}{month}/")
-            details.append(f"promoted rotating/{set_name} to monthly/{month}")
-            logger.info("Promoted rotating/%s to monthly/%s", set_name, month)
+            details.append(
+                f"promoted rotating/{set_name} to monthly/{month} (check: {status})"
+            )
+            logger.info(
+                "Promoted rotating/%s to monthly/%s, paired check %s",
+                set_name, month, status,
+            )
             return
 
     # Not a failure. Promotion simply retries on the next backup run, which
     # is why the tier needs no scheduled job of its own.
-    details.append(f"no rotating set of {month} has a passing check yet, monthly not promoted")
+    details.append(f"no rotating set of {month} has an eligible check yet, monthly not promoted")
     day_of_month = int(date_stamp[8:10])
     if day_of_month >= config["promotion"]["no_candidate_alert_days"]:
         message = (
             f"{month} is {day_of_month} days in with nothing promoted to the "
-            f"monthly tier - no rotating set has a paired PASS from the check job"
+            f"monthly tier - no rotating set has a paired check of "
+            f"{' or '.join(promote_on)} from the check job"
         )
         logger.warning(message)
         details.append(message)

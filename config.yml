@@ -139,14 +139,39 @@ retention:
 
 
 promotion:
-  # A set is eligible for promotion to the monthly tier only if its
-  # paired check status was PASS. Artifact validation (zip opens,
-  # counts sane) proves the file is intact, NOT that the data is good -
-  # a faithful snapshot of corrupt data passes artifact validation.
-  # Without this rule a corrupt set can become the monthly anchor that
-  # the trend comparison is measured against for the rest of the month.
-  require_check_pass: true
-  # If no set has passed yet, promotion retries on the next backup run.
+  # Which check outcomes make a rotating set eligible for the monthly tier.
+  #
+  # Some gate is needed. Artifact validation (zip opens, counts sane) proves
+  # the file is intact, NOT that the data is good - a faithful snapshot of
+  # corrupt data passes artifact validation cleanly. Without a gate a corrupt
+  # set can become the monthly anchor that the trend comparison is measured
+  # against for the rest of the month, so the reference for "normal" would
+  # itself be wrong.
+  #
+  # But the gate was PASS only until 2026-08-19, and that was too tight.
+  # WARN is defined as below the action threshold - it routes to the
+  # developer alone precisely because it is not worth the client acting on -
+  # so treating it as unfit to archive contradicted what it means everywhere
+  # else. And the cost was real rather than theoretical: the feature_count
+  # rule compares against the 30-day median and the monthly anchor as well as
+  # yesterday, so one legitimate bulk load can hold a WARN for weeks. Every
+  # backup run in that window would have been refused promotion, and a data
+  # issue that nobody is scheduled to fix for a fortnight would have quietly
+  # cost the month its archive copy.
+  #
+  # So: only a verdict that the data is actually wrong blocks the archive.
+  # DATA_FAIL is that verdict - a suspiciously low count, a map cell emptied,
+  # a schema change. Everything else is reported and blocks nothing, which is
+  # the same rule the validity findings follow (DESIGN.md 7.6.1).
+  #
+  # SYSTEM_FAIL and BASELINE are absent for a different reason: neither is a
+  # verdict at all. One means the check could not run, the other that there
+  # was nothing to compare against. Both clear within a day or two and both
+  # raise their own alert, so neither has the weeks-long backlog problem the
+  # WARN change was made for. Add them here if a month is ever at risk of
+  # going unarchived because the check job was down for it.
+  promote_on: [PASS, WARN]
+  # If no set is eligible yet, promotion retries on the next backup run.
   # Alert if the month is this far in with nothing promoted.
   no_candidate_alert_days: 10
 
