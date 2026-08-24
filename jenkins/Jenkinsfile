@@ -41,6 +41,19 @@ pipeline {
         // hour's build starts.
         timeout(time: 15, unit: 'MINUTES')
         disableConcurrentBuilds()
+        // "Pipeline script from SCM" otherwise checks the repository out onto
+        // the agent before the first stage runs, and that is the exact step
+        // the first build died at. Skipping it is what lets this file be read
+        // from source control without asking the agent for anything new: the
+        // CONTROLLER fetches this one file with a lightweight checkout, and
+        // the agent still gets notify.py and config.yml from object storage.
+        //
+        // An agent-side checkout is still available, as CODE_SOURCE below, but
+        // it has to be chosen rather than inherited.
+        //
+        // Harmless on an inline pipeline script, which has no default checkout
+        // to skip.
+        skipDefaultCheckout()
     }
 
     triggers {
@@ -76,6 +89,58 @@ pipeline {
             name: 'DRY_RUN',
             defaultValue: false,
             description: 'Report what would be sent and send nothing. Writes no state, so it cannot suppress a later real alert.'
+        )
+
+        // Where notify.py and config.yml come from.
+        //
+        // 'object_storage' is the route that works. A GitHub Actions workflow
+        // publishes both files and a checksum manifest under code/ on every
+        // push to main, and the fetch stage downloads them. It asks nothing of
+        // the agent but reach to the object storage endpoint.
+        //
+        // 'git' checks the repository out on the agent instead. That is what
+        // the first build failed at - and it failed at the NRS forward proxy
+        // Jenkins hands every agent, not at github.com:
+        //
+        //     Failed to connect to forwardproxy.nrs.bcgov port 23128: Timed out
+        //
+        // which reads as an agent being given a proxy it cannot use rather
+        // than as github.com being blocked. The no_proxy parameter below is
+        // the test of that reading. Choose 'git' on a manual build to run it.
+        // Scheduled builds take the default, so they keep using object storage
+        // whatever the outcome.
+        choice(
+            name: 'CODE_SOURCE',
+            choices: ['object_storage', 'git'],
+            description: 'Where to get notify.py and config.yml. Leave on object_storage unless you are testing the checkout.'
+        )
+
+        // Git reads no_proxy from the environment and connects direct to
+        // whatever it names, so this is what would let a checkout bypass a
+        // proxy the agent cannot reach.
+        //
+        // A PARAMETER RATHER THAN AN environment{} ENTRY, ON PURPOSE. Jenkins
+        // puts build parameters into the environment before the build starts,
+        // which is early enough for a checkout Jenkins performs by itself; an
+        // environment{} block is not. This job skips that checkout (see
+        // options above), so today either form would do - but the parameter
+        // form is the one that stays correct if the default checkout is ever
+        // turned back on.
+        //
+        // AND IT MUST BE DECLARED HERE, not only on the job configuration
+        // screen. A declarative parameters block REPLACES the job's parameter
+        // list on every build, so a no_proxy added through the UI and missing
+        // from this file survives exactly until the first build and then
+        // disappears - and a checkout that worked once starts failing again
+        // with nothing on screen to say why.
+        //
+        // Lowercase, because that is the spelling libcurl and therefore git
+        // reads. It names github.com only, so the object storage calls - which
+        // go to a different host - are unaffected either way.
+        string(
+            name: 'no_proxy',
+            defaultValue: 'github.com',
+            description: 'Hosts git should reach directly rather than through the proxy Jenkins configures. Used only when CODE_SOURCE is git.'
         )
     }
 
@@ -154,21 +219,34 @@ pipeline {
         ALERT_DEVELOPER = credentials('wlw-alert-developer')
     }
 
-    // THIS PIPELINE NEVER CHECKS THE REPOSITORY OUT, and that is the point of
-    // the fetch stage below.
+    // BY DEFAULT THE AGENT CHECKS NOTHING OUT, and that is the point of the
+    // fetch stage below.
     //
-    // The agents that run this job cannot reach github.com. They can reach
-    // object storage. So the bucket carries the code to them: a GitHub Actions
-    // workflow publishes notify.py and config.yml under the code/ prefix on
-    // every push to main, and the first stage here downloads them.
+    // The agent that ran the first build could not reach github.com. It could
+    // reach object storage. So the bucket carries the code to it: a GitHub
+    // Actions workflow publishes notify.py and config.yml under the code/
+    // prefix on every push to main, and the fetch stage downloads them and
+    // checks them against a manifest.
     //
-    // Which means this file is pasted into the Jenkins job as an inline
-    // pipeline script rather than read from source control. The copy in the
-    // repository is the canonical one - edit there, review there, then paste.
-    // A change made only in the job configuration is a change nobody can see.
+    // HOW THIS FILE ITSELF ARRIVES IS A SEPARATE QUESTION, and the two are
+    // worth keeping apart, because they depend on different machines.
+    // Defining the job as "Pipeline script from SCM" WITH LIGHTWEIGHT CHECKOUT
+    // TICKED asks nothing of the agent at all: the controller reads this one
+    // file straight from GitHub, and the controller has always been able to -
+    // it read this file on the very build that then died at the agent's
+    // checkout. Worth having, because the alternative is pasting this file
+    // into the job configuration by hand and trusting two copies to stay the
+    // same.
     //
-    // What the agent needs from its machine is now just two things: reach to
-    // the object storage endpoint, and reach to the mail relay.
+    // If the job is instead defined as an inline pipeline script, the copy in
+    // the repository is still the canonical one - edit there, review there,
+    // then paste. A change made only in the job configuration is a change
+    // nobody can see.
+    //
+    // Either way, what the agent needs from its own machine is two things:
+    // reach to the object storage endpoint, and reach to the mail relay.
+    // CODE_SOURCE=git adds github.com to that list, which is why it is not
+    // the default.
     stages {
         // The environment check runs FIRST, before the fetch. The fetch itself
         // needs boto3, so an interpreter missing it would fail there with a
@@ -204,6 +282,8 @@ pipeline {
         }
 
         stage('Fetch the code') {
+            when { expression { params.CODE_SOURCE != 'git' } }
+
             steps {
                 // The bucket and prefix are written out here rather than read
                 // from config.yml, because this is the step that fetches
@@ -283,6 +363,45 @@ if __name__ == "__main__":
     sys.exit(main())
 '''
                 bat '"%PYTHON%" fetch_code.py'
+            }
+        }
+
+        stage('Check the code out from GitHub') {
+            when { expression { params.CODE_SOURCE == 'git' } }
+
+            steps {
+                // The alternative to the fetch above, and a test rather than a
+                // default: this is the step the first build failed at.
+                //
+                // It puts notify.py and config.yml in exactly the places the
+                // fetch stage would have put them, so the poll stage that
+                // follows neither knows nor cares which one ran. The git
+                // plugin logs the revision it checked out, which is the same
+                // thing the manifest's code version line gives the other
+                // route: every build says which code produced its behaviour.
+                //
+                // Three failures to tell apart if it does not work:
+                //
+                //   "Failed to connect to forwardproxy.nrs.bcgov port 23128"
+                //       no_proxy is not reaching git. Check the job still
+                //       lists it as a parameter - a build of a revision of
+                //       this file without it will have taken it away - and
+                //       that it is spelled in lowercase.
+                //
+                //   a timeout or a refusal naming github.com itself
+                //       the agents genuinely cannot reach it, the original
+                //       reading was right, and object storage stays the route.
+                //
+                //   "No such property: scm"
+                //       this job is defined as an inline Pipeline script, so
+                //       there is no SCM configuration to check out and
+                //       CODE_SOURCE has to stay on object_storage.
+                //
+                // Whichever it is, nothing is stranded. Put CODE_SOURCE back
+                // to object_storage and the next build is the working job
+                // again, with no edit to this file and no re-paste.
+                echo "Checking out with no_proxy=${params.no_proxy}"
+                checkout scm
             }
         }
 
