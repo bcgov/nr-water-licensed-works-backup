@@ -91,33 +91,54 @@ pipeline {
             description: 'Report what would be sent and send nothing. Writes no state, so it cannot suppress a later real alert.'
         )
 
-        // Where notify.py and config.yml come from.
+        // Where notify.py and config.yml come from. Both routes work and
+        // both are kept; this chooses which one a build uses.
         //
-        // 'object_storage' is the route that works. A GitHub Actions workflow
-        // publishes both files and a checksum manifest under code/ on every
-        // push to main, and the fetch stage downloads them. It asks nothing of
-        // the agent but reach to the object storage endpoint.
+        // 'git' checks the repository out on the agent. It is the default
+        // since 2026-08-24 for one reason above the others: A CHECKOUT OF main
+        // CANNOT BE STALE. The other route depends on a GitHub Actions
+        // workflow having published, and if that workflow ever stops firing -
+        // an edited paths filter, an expired secret - the bucket keeps serving
+        // old code and every build stays green while doing it. A notifier
+        // quietly running last month's routing table is the failure this
+        // project least wants, and it is the one failure a checkout cannot
+        // have. It also means the Jenkinsfile and the code it runs come from
+        // the same commit, which the other route cannot promise.
         //
-        // 'git' checks the repository out on the agent instead. That is what
-        // the first build failed at - and it failed at the NRS forward proxy
-        // Jenkins hands every agent, not at github.com:
+        // This is the step the first build failed at, and it failed at the NRS
+        // forward proxy Jenkins hands every agent rather than at github.com:
         //
         //     Failed to connect to forwardproxy.nrs.bcgov port 23128: Timed out
         //
-        // which reads as an agent being given a proxy it cannot use rather
-        // than as github.com being blocked. The no_proxy parameter below is
-        // the test of that reading. Choose 'git' on a manual build to run it.
-        // Scheduled builds take the default, so they keep using object storage
-        // whatever the outcome.
+        // no_proxy below is what makes it work, and a successful build still
+        // logs "Setting http proxy: forwardproxy.nrs.bcgov:23128" immediately
+        // before the fetch - the proxy is still configured, git just goes past
+        // it. Proven on zavijava_rfc, the agent that produced that failure.
+        //
+        // 'object_storage' is the fallback and was the default until
+        // 2026-08-24. A GitHub Actions workflow publishes both files and a
+        // checksum manifest under code/ on every push to main, and the fetch
+        // stage downloads and verifies them. It asks nothing of the agent but
+        // reach to the object storage endpoint, which is the sanctioned route
+        // on these servers - so it is what to switch to if direct egress to
+        // github.com is ever closed off, or if the checkout breaks for any
+        // other reason.
+        //
+        // THAT PUBLISH WORKFLOW MUST KEEP RUNNING even though the default no
+        // longer uses it. A fallback nobody has published to in six months is
+        // not a fallback.
         choice(
             name: 'CODE_SOURCE',
-            choices: ['object_storage', 'git'],
-            description: 'Where to get notify.py and config.yml. Leave on object_storage unless you are testing the checkout.'
+            choices: ['git', 'object_storage'],
+            description: 'Where to get notify.py and config.yml. Switch to object_storage if the checkout stops working.'
         )
 
         // Git reads no_proxy from the environment and connects direct to
-        // whatever it names, so this is what would let a checkout bypass a
-        // proxy the agent cannot reach.
+        // whatever it names, so this is what lets the checkout bypass a proxy
+        // the agent cannot reach. WITH CODE_SOURCE DEFAULTING TO git, THIS IS
+        // LOAD-BEARING ON EVERY SCHEDULED BUILD - a timer-triggered build of a
+        // parameterised job takes the defaults declared here, so this default
+        // is what the hourly poll runs on.
         //
         // A PARAMETER RATHER THAN AN environment{} ENTRY, ON PURPOSE. Jenkins
         // puts build parameters into the environment before the build starts,
@@ -285,6 +306,11 @@ pipeline {
             when { expression { params.CODE_SOURCE != 'git' } }
 
             steps {
+                // THE FALLBACK ROUTE since 2026-08-24, and the default before
+                // it. Everything below is unchanged from when it was the only
+                // way the code could arrive; what changed is which value of
+                // CODE_SOURCE selects it.
+                //
                 // The bucket and prefix are written out here rather than read
                 // from config.yml, because this is the step that fetches
                 // config.yml. Both are already in the repository in plain
@@ -370,17 +396,34 @@ if __name__ == "__main__":
             when { expression { params.CODE_SOURCE == 'git' } }
 
             steps {
-                // The alternative to the fetch above, and a test rather than a
-                // default: this is the step the first build failed at.
+                // THE DEFAULT ROUTE since 2026-08-24. It puts notify.py and
+                // config.yml in exactly the places the fetch stage would have
+                // put them, so the poll stage that follows neither knows nor
+                // cares which one ran, and the git plugin logs the revision it
+                // checked out - the same thing the manifest's code version
+                // line gives the other route, so every build still says which
+                // code produced its behaviour.
                 //
-                // It puts notify.py and config.yml in exactly the places the
-                // fetch stage would have put them, so the poll stage that
-                // follows neither knows nor cares which one ran. The git
-                // plugin logs the revision it checked out, which is the same
-                // thing the manifest's code version line gives the other
-                // route: every build says which code produced its behaviour.
+                // WHY THIS ONE IS THE DEFAULT, given the other works too: a
+                // checkout of main cannot be stale. The other route depends on
+                // a GitHub Actions workflow having published, and if that
+                // workflow ever stops firing the bucket keeps serving old code
+                // while every build stays green. A notifier quietly running
+                // last month's routing table is the failure this project least
+                // wants, and it is the one failure a checkout cannot have.
                 //
-                // Three failures to tell apart if it does not work:
+                // What proved it possible: the agents are NOT blocked from
+                // github.com. Jenkins configures them with a forward proxy
+                // that times out from the agents themselves, and no_proxy
+                // makes git go direct instead. A successful build still logs
+                // "Setting http proxy: forwardproxy.nrs.bcgov:23128" right
+                // before the fetch, which is the proof - the proxy was set,
+                // and git ignored it for github.com. Proven on zavijava_rfc,
+                // the agent that produced the original failure.
+                //
+                // Three failures to tell apart if it ever stops working. IN
+                // ALL THREE THE FIX IS THE SAME AND TAKES ONE FIELD: set
+                // CODE_SOURCE to object_storage and the job carries on.
                 //
                 //   "Failed to connect to forwardproxy.nrs.bcgov port 23128"
                 //       no_proxy is not reaching git. Check the job still
@@ -389,17 +432,20 @@ if __name__ == "__main__":
                 //       that it is spelled in lowercase.
                 //
                 //   a timeout or a refusal naming github.com itself
-                //       the agents genuinely cannot reach it, the original
-                //       reading was right, and object storage stays the route.
+                //       direct egress to github.com has been closed off. It
+                //       was open on 2026-08-24; the proxy is the sanctioned
+                //       route and this bypasses it, so this is the failure to
+                //       expect eventually. Object storage is unaffected, which
+                //       is exactly why it is still published to.
                 //
                 //   "No such property: scm"
                 //       this job is defined as an inline Pipeline script, so
                 //       there is no SCM configuration to check out and
                 //       CODE_SOURCE has to stay on object_storage.
                 //
-                // Whichever it is, nothing is stranded. Put CODE_SOURCE back
-                // to object_storage and the next build is the working job
-                // again, with no edit to this file and no re-paste.
+                // Whichever it is, nothing is stranded, because the publish
+                // workflow keeps the bucket current whether or not any build
+                // is reading from it.
                 echo "Checking out with no_proxy=${params.no_proxy}"
                 checkout scm
             }

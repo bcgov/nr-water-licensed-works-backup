@@ -1353,8 +1353,10 @@ def bootstrap_source():
     """The fetch script embedded in the Jenkinsfile, pulled back out.
 
     It is written inline there rather than kept as a file of its own because
-    the Jenkins job runs as a pasted pipeline script with no checkout - so
-    whatever fetches the code has to travel inside the thing being pasted.
+    the AGENT never checks the repository out. The Jenkinsfile itself does now
+    come from source control, but by a lightweight checkout on the controller,
+    which reads that one file and gives the agent no workspace to load a second
+    one from. So whatever fetches the code still has to travel inside it.
     Extracting it here is what lets it be parsed and held to a contract like
     any other module.
     """
