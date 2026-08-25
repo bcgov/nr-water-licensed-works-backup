@@ -10,8 +10,8 @@ changed since the last poll, and sends mail through the internal SMTP relay.
 GitHub-hosted runners cannot reach the relay and the GIS server can, which is
 the whole reason this job exists on a second platform (DESIGN.md 8.1). Actions
 does all the substantive work and writes a status object every run; this job
-reads `status`, looks the recipients up in config.yml, and sends `summary` as
-the body. All judgement stays in checks.py - with two deliberate exceptions,
+reads `status`, looks the recipients up in config.yml, and builds the message
+around `summary`. All judgement stays in checks.py - with two deliberate exceptions,
 both marked where they happen. no_monthly_candidate is reported in the details
 of a run whose status is PASS, and PASS routes to nobody. features_outside_bc
 is kept out of the status on purpose, because a status that can never be PASS
@@ -23,6 +23,15 @@ travels in that run's own message: the status, the summary, the validity
 findings and the details. A finding was briefly given a message of its own and
 it was the wrong shape - the recipient got two emails about one check, and had
 to put them together to know what the check had said.
+
+WRITTEN FOR THE PERSON WHO OPENS IT, NOT FOR US. Most of these go to a data
+owner and a shared mailbox, and neither has any reason to know what a run id
+is. So every message says what happened in plain language first, then what
+needs a person, then that nothing has been touched - and the run identifiers
+sit at the very bottom under a heading everybody else can stop at. Each one is
+sent twice over, as formatted HTML and as plain text, both rendered from one
+list of blocks so they cannot come to say different things. See `The messages`
+below before rewording anything: the language there is the product.
 
 ONE WRITE, TO ONE KEY. This job lists and reads under status/, and the only
 thing it writes anywhere is its own deduplication state, to notify/state.json.
@@ -68,6 +77,7 @@ import logging
 import os
 import smtplib
 import sys
+import textwrap
 from dataclasses import dataclass
 from email.message import EmailMessage
 from pathlib import Path
@@ -139,7 +149,7 @@ RESOLVING_STATUSES = ("WARN", "DATA_FAIL", "SYSTEM_FAIL")
 # month's time.
 MONTHLY_CANDIDATE_MARKER = "days in with nothing promoted to the monthly tier"
 PRUNE_PAUSED_MARKER = "pruning paused"
-OUTSIDE_BC_MARKER = "fall outside British Columbia entirely"
+OUTSIDE_BC_MARKER = "outside British Columbia"
 
 # How far back the episode walks read. An episode longer than this is
 # truncated, which is harmless: the walks are only ever asked whether an
@@ -163,17 +173,6 @@ WEEKDAY_NAMES = (
 )
 
 SUBJECT_PREFIX = "[Water Licensed Works]"
-
-# Every message ends with this. The recipients include people who do not work
-# on the pipeline, and the first question an alert raises is "has something
-# been done to my data" - to which the answer is always no.
-FOOTER = (
-    "Nothing has been changed in ArcGIS Online and no backup has been deleted.\n"
-    "This pipeline only reads and reports. Recovering data is a decision for\n"
-    "the data owner and is carried out by hand.\n"
-    "\n"
-    "Sent by the Water Licensed Works notification job on the GIS server."
-)
 
 
 @dataclass
@@ -218,6 +217,11 @@ class Notification:
     once a day, so a key or a value built from one turns a five-day incident
     into five emails, and a threshold re-evaluated on every poll into one an
     hour. DESIGN.md 8.5.
+
+    body and html are the same message written twice - both are rendered from
+    one list of blocks, so they cannot say different things. The mail carries
+    both and the recipient's client picks; body is also what --dry-run prints,
+    because it is the version a person can read in a terminal.
     """
 
     key: str
@@ -225,6 +229,7 @@ class Notification:
     roles: list
     subject: str
     body: str
+    html: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -423,9 +428,9 @@ def outside_bc_lines(record):
 def outside_bc_signature(lines):
     """What the out-of-province situation currently is, as one short string.
 
-    checks.py writes each line as '<layer>: <count> feature(s) fall outside
-    British Columbia entirely - OBJECTID ...', so the layer and the count are
-    the front of it and everything that follows is detail. Reading only those
+    checks.py writes each line as '<layer>: <count> features are outside
+    British Columbia (OBJECTID ...)', so the layer and the count are the front
+    of it and everything that follows is detail. Reading only those
     two is what makes a run that names the same records produce no second
     email, while a third bad record appearing produces one.
 
@@ -699,6 +704,342 @@ def addresses_for(roles, addresses):
 
 # ---------------------------------------------------------------------------
 # The messages
+#
+# A message is a list of blocks, and every block renders twice: once as plain
+# text and once as HTML. Writing it that way keeps the wording in one place,
+# so the formatted email and the fallback cannot drift apart.
+#
+# Outlook is the client here, so it gets headings, bullets and small tables;
+# anything that cannot show HTML falls back to the text version, which has to
+# stay readable on its own. **Double asterisks** mark bold and are the only
+# markup - they read as emphasis in the text version too, so nothing is lost.
+#
+# WHO EACH PART IS FOR. The data owner and the shared inbox want to know what
+# happened and whether anything needs a person. Run identifiers, commit hashes
+# and workflow links are the maintainer's, and they sit at the foot of the
+# message under their own heading, where everybody else can stop reading. A
+# commit hash in the middle of a message about somebody's data is noise that
+# makes the part they can act on harder to find.
+# ---------------------------------------------------------------------------
+
+# First line of every message. The first question an automated email raises is
+# whether a person sent it, and the highlight is there so that answer is read
+# before anything else rather than found at the bottom.
+BANNER = "**Sent automatically** by the Water Licensed Works notification job."
+
+# Last line of every message, before the maintainer's section. The recipients
+# include people who do not work on the pipeline, and the question an alert
+# raises for them is "has something been done to my data" - to which the
+# answer is always no.
+FOOTER = (
+    "**Nothing has been changed.** This job only reads the data and reports "
+    "on it. It never edits ArcGIS Online and it never deletes a backup. "
+    "Restoring data is always the data owner's decision, and is done by hand."
+)
+
+TECHNICAL_HEADING = "Technical details - for the pipeline maintainer"
+
+# Where the plain text version wraps. Nothing here is read in a terminal wider
+# than a mail client's reading pane, and an unwrapped paragraph arrives as one
+# very long line in the clients that do not wrap it themselves.
+TEXT_WIDTH = 76
+
+# What each status means, in the words somebody who has never seen this
+# pipeline would use. The status word on its own is jargon - "BASELINE" tells
+# the data owner nothing - and a five-word vocabulary is not something anybody
+# should have to learn in order to read their own alerts.
+STATUS_MEANINGS = {
+    "PASS": "nothing changed since the last run",
+    "BASELINE": "first run, nothing to compare against yet",
+    "WARN": "something moved more than expected",
+    "DATA_FAIL": "the data changed in a way that needs a person",
+    "SYSTEM_FAIL": "the job itself could not finish",
+}
+
+# The lead-in checks.summarise puts in front of a validity finding when it
+# appends one to a run's summary. The finding gets a section of its own a few
+# lines further down every email, so the summary is cut here rather than
+# printing it twice. One contract written in two files, like the three markers
+# above; tests/test_notify.py builds a real summary from checks.py and asserts
+# that this still splits it.
+FINDING_LEAD_IN = " Also flagged: "
+
+
+# ---------------------------------------------------------------------------
+# Blocks
+# ---------------------------------------------------------------------------
+
+
+def heading(text):
+    """A section title."""
+    return ("heading", text)
+
+
+def paragraph(text):
+    """One paragraph of prose."""
+    return ("paragraph", text)
+
+
+def bullets(items):
+    """A list. Anything that is really several facts should be one of these."""
+    return ("bullets", [str(item) for item in items])
+
+
+def table(rows, headers=None):
+    """A small table, one tuple per row.
+
+    With no headers and two columns per row the first column is read as a
+    label and shaded, which is the shape most of these are: a handful of facts
+    a reader can take in without having to read a sentence.
+    """
+    return ("table", (headers, [tuple(str(cell) for cell in row) for row in rows]))
+
+
+def technical(blocks):
+    """The maintainer's section. Always rendered last, however it is passed."""
+    return ("technical", [block for block in blocks if block])
+
+
+# ---------------------------------------------------------------------------
+# Rendering
+# ---------------------------------------------------------------------------
+
+
+def plain(text):
+    """One string for the text version: the bold markers taken back out."""
+    return str(text).replace("**", "")
+
+
+def escape(text):
+    """The three characters that would otherwise be read as HTML."""
+    return (
+        str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    )
+
+
+def rich(text):
+    """One string for the HTML version: escaped, with **bold** marked up.
+
+    Split on the marker and emphasise the odd-numbered pieces, which are the
+    ones that sat between a pair. An unpaired marker can only over-emphasise
+    the tail of a line and never produce broken HTML, because every piece is
+    escaped before any tag is added to it.
+    """
+    pieces = escape(text).split("**")
+    return "".join(
+        f"<strong>{piece}</strong>" if index % 2 else piece
+        for index, piece in enumerate(pieces)
+    )
+
+
+def text_table(headers, rows):
+    """A table as padded columns, each one as wide as its longest cell."""
+    if not rows:
+        return ""
+    measured = ([tuple(headers)] + rows) if headers else rows
+    widths = [
+        max(len(plain(row[column])) for row in measured)
+        for column in range(len(measured[0]))
+    ]
+    lines = []
+    if headers:
+        lines.append(text_table_row(headers, widths))
+        lines.append("  " + "  ".join("-" * width for width in widths))
+    lines.extend(text_table_row(row, widths) for row in rows)
+    return "\n".join(lines)
+
+
+def text_table_row(cells, widths):
+    padded = [plain(cell).ljust(width) for cell, width in zip(cells, widths)]
+    return ("  " + "  ".join(padded)).rstrip()
+
+
+def render_text(blocks):
+    """The plain text version of a list of blocks.
+
+    A heading sits directly on top of what it introduces and is underlined, so
+    that the text version has the same structure the HTML one does rather than
+    arriving as one undifferentiated wall.
+    """
+    rendered = ""
+    previous = None
+    for kind, content in blocks:
+        if kind == "banner":
+            piece = f"*** {plain(content)} ***"
+        elif kind == "heading":
+            piece = plain(content) + "\n" + "-" * len(plain(content))
+        elif kind in ("paragraph", "footer"):
+            piece = textwrap.fill(plain(content), TEXT_WIDTH)
+        elif kind == "bullets":
+            piece = "\n".join(
+                textwrap.fill(
+                    plain(item), TEXT_WIDTH,
+                    initial_indent="  - ", subsequent_indent="    ",
+                )
+                for item in content
+            )
+        elif kind == "table":
+            piece = text_table(*content)
+        elif kind == "technical":
+            piece = "\n".join(
+                ["-" * 70, TECHNICAL_HEADING, "", render_text(content)]
+            )
+        else:
+            raise ValueError(
+                f"Unknown message block '{kind}'. The kinds are the ones the "
+                f"block helpers above return."
+            )
+
+        if not piece.strip():
+            continue
+        if rendered:
+            rendered += "\n" if previous == "heading" else "\n\n"
+        rendered += piece
+        previous = kind
+    return rendered
+
+
+# Inline styles, because the clients here are Outlook and a shared mailbox and
+# both drop a stylesheet in the head. Held as constants rather than repeated
+# through the markup so that a colour is changed in one place.
+BODY_STYLE = (
+    "font-family:'Segoe UI',Calibri,Arial,sans-serif;font-size:14px;"
+    "line-height:1.5;color:#1f2328;max-width:660px;"
+)
+BANNER_STYLE = (
+    "background-color:#fff6cc;border-left:4px solid #e0aa00;padding:10px 14px;"
+    "font-size:13px;color:#5a4600;"
+)
+HEADING_STYLE = "font-size:15px;font-weight:600;color:#1f2328;margin:22px 0 8px 0;"
+PARAGRAPH_STYLE = "margin:0 0 10px 0;"
+LIST_STYLE = "margin:0 0 12px 0;padding-left:22px;"
+ITEM_STYLE = "margin:0 0 5px 0;"
+TABLE_STYLE = "border-collapse:collapse;margin:0 0 14px 0;font-size:13px;"
+CELL_STYLE = "border:1px solid #d8dee4;padding:6px 11px;vertical-align:top;"
+HEADER_CELL_STYLE = (
+    CELL_STYLE + "background-color:#eef1f5;font-weight:600;text-align:left;"
+)
+LABEL_CELL_STYLE = (
+    CELL_STYLE + "background-color:#f6f8fa;color:#57606a;white-space:nowrap;"
+)
+FOOTER_STYLE = "margin:18px 0 0 0;color:#57606a;font-size:13px;"
+TECHNICAL_STYLE = (
+    "border-top:1px solid #d8dee4;margin-top:26px;padding-top:14px;"
+    "font-size:12px;color:#57606a;"
+)
+LINK_STYLE = "color:#0b5cad;"
+
+
+def html_cell(text):
+    """One table cell. A URL becomes a link, anything else is ordinary text."""
+    value = str(text)
+    if value.startswith("http://") or value.startswith("https://"):
+        return f'<a href="{escape(value)}" style="{LINK_STYLE}">{escape(value)}</a>'
+    return rich(value)
+
+
+def html_table(headers, rows):
+    if not rows:
+        return ""
+    parts = [
+        f'<table role="presentation" cellspacing="0" cellpadding="0" '
+        f'style="{TABLE_STYLE}">'
+    ]
+    if headers:
+        cells = "".join(
+            f'<th style="{HEADER_CELL_STYLE}">{rich(cell)}</th>' for cell in headers
+        )
+        parts.append(f"<tr>{cells}</tr>")
+    # Two columns and no header row is the label-and-value shape.
+    labelled = not headers and all(len(row) == 2 for row in rows)
+    for row in rows:
+        cells = ""
+        for index, cell in enumerate(row):
+            style = LABEL_CELL_STYLE if labelled and index == 0 else CELL_STYLE
+            cells += f'<td style="{style}">{html_cell(cell)}</td>'
+        parts.append(f"<tr>{cells}</tr>")
+    parts.append("</table>")
+    return "".join(parts)
+
+
+def render_html(blocks):
+    """The HTML version of a list of blocks."""
+    parts = []
+    for kind, content in blocks:
+        if kind == "banner":
+            # A single-cell table rather than a styled div: Outlook renders a
+            # background colour on a table cell reliably and on a div it is a
+            # coin toss, and a banner that is not highlighted is the one thing
+            # this block exists to avoid.
+            parts.append(
+                f'<table role="presentation" cellspacing="0" cellpadding="0" '
+                f'width="100%" style="border-collapse:collapse;margin:0 0 20px 0;">'
+                f'<tr><td style="{BANNER_STYLE}">{rich(content)}</td></tr></table>'
+            )
+        elif kind == "heading":
+            parts.append(f'<div style="{HEADING_STYLE}">{rich(content)}</div>')
+        elif kind == "paragraph":
+            parts.append(f'<p style="{PARAGRAPH_STYLE}">{rich(content)}</p>')
+        elif kind == "footer":
+            parts.append(f'<p style="{FOOTER_STYLE}">{rich(content)}</p>')
+        elif kind == "bullets":
+            items = "".join(
+                f'<li style="{ITEM_STYLE}">{rich(item)}</li>' for item in content
+            )
+            parts.append(f'<ul style="{LIST_STYLE}">{items}</ul>')
+        elif kind == "table":
+            parts.append(html_table(*content))
+        elif kind == "technical":
+            parts.append(
+                f'<div style="{TECHNICAL_STYLE}">'
+                f'<div style="font-weight:600;margin:0 0 8px 0;">'
+                f'{escape(TECHNICAL_HEADING)}</div>'
+                f'{render_html(content)}</div>'
+            )
+        else:
+            raise ValueError(
+                f"Unknown message block '{kind}'. The kinds are the ones the "
+                f"block helpers above return."
+            )
+    return "".join(parts)
+
+
+def html_document(blocks):
+    return (
+        "<html><body>"
+        f'<div style="{BODY_STYLE}">{render_html(blocks)}</div>'
+        "</body></html>"
+    )
+
+
+def full_message(blocks):
+    """Banner, what the message says, the reassurance, then the technical bit.
+
+    The maintainer's section is moved to the end wherever the caller put it,
+    so that a message builder can keep it next to the run it describes while
+    the reader still gets the part that concerns them first.
+    """
+    kept = [block for block in blocks if block]
+    ordinary = [block for block in kept if block[0] != "technical"]
+    maintainer = [block for block in kept if block[0] == "technical"]
+    return [("banner", BANNER), *ordinary, ("footer", FOOTER), *maintainer]
+
+
+def notification(key, value, roles, subject, blocks):
+    """One email, with both versions of its body rendered from the blocks."""
+    prepared = full_message(blocks)
+    return Notification(
+        key=key,
+        value=value,
+        roles=list(roles),
+        subject=subject,
+        body=render_text(prepared) + "\n",
+        html=html_document(prepared),
+    )
+
+
+# ---------------------------------------------------------------------------
+# The parts the messages are built from
 # ---------------------------------------------------------------------------
 
 
@@ -707,37 +1048,55 @@ def local_text(config, moment):
     return moment.astimezone(ZoneInfo(config["timezone"])).strftime("%Y-%m-%d %H:%M %Z")
 
 
-def run_block(config, record):
-    """The facts about one run, under the summary, in every message about it."""
-    payload = record.payload
-    lines = [
-        f"Job:     {JOB_LABELS[record.job]}",
-        f"Status:  {status_of(record)}",
-        f"Run:     {payload.get('run_id', record.key)}",
-        f"When:    {local_text(config, record.moment)}",
-        f"Code:    {payload.get('code_version', 'unknown')}",
-    ]
-    url = payload.get("workflow_run_url")
-    # Null for a run started outside Actions - a hand run, or the Phase 2 call
-    # from the NRIDS server. Saying so beats printing an empty field.
-    lines.append(f"Log:     {url}" if url else "Log:     not a GitHub Actions run")
+def result_cell(status):
+    """The status with its meaning beside it, for the table at the top."""
+    meaning = STATUS_MEANINGS.get(status)
+    return f"**{status}** - {meaning}" if meaning else f"**{status}**"
 
+
+def at_a_glance(config, record):
+    """The three facts every recipient needs: which job, how it went, when."""
+    return table([
+        ("Job", JOB_LABELS[record.job]),
+        ("Result", result_cell(status_of(record))),
+        ("When", local_text(config, record.moment)),
+    ])
+
+
+def summary_of(record):
+    """The run's own plain-language summary, without any finding on the end.
+
+    checks.py appends a validity finding to the summary so that the line is
+    complete wherever it is read - in the status object, in a metrics file, in
+    a log. In an email that finding has a section of its own a few lines
+    below, so carrying it here as well would print it twice.
+    """
+    summary = record.payload.get("summary") or "(the run wrote no summary)"
+    return summary.split(FINDING_LEAD_IN, 1)[0].strip()
+
+
+def technical_blocks(config, record):
+    """The run identifiers, and the raw lines the run logged.
+
+    All of it is for whoever has to look a run up: the run id, the commit that
+    produced it, the workflow log, and the check messages in the words the
+    code wrote them in. None of it is the data owner's, which is why it sits
+    behind its own heading at the foot of the message.
+    """
+    payload = record.payload
+    url = payload.get("workflow_run_url")
+    blocks = [table([
+        ("Run", payload.get("run_id", record.key)),
+        ("Code", payload.get("code_version", "unknown")),
+        # Null for a run started outside Actions - a hand run, or the Phase 2
+        # call from the NRIDS server. Saying so beats printing an empty field.
+        ("Log", url if url else "not a GitHub Actions run"),
+    ])]
     details = payload.get("details") or []
     if details:
-        lines.append("")
-        lines.append("What the run reported:")
-        lines.extend(f"  - {line}" for line in details)
-    return "\n".join(lines)
-
-
-def message_body(paragraphs):
-    """Assemble a plain text body with the standard footer.
-
-    Empty paragraphs are dropped rather than rendered as a gap: a run that
-    wrote no summary should not leave a blank line where one was expected.
-    """
-    kept = [paragraph for paragraph in paragraphs if paragraph and paragraph.strip()]
-    return "\n\n".join([*kept, FOOTER]) + "\n"
+        blocks.append(paragraph("**What the run reported**"))
+        blocks.append(bullets(details))
+    return blocks
 
 
 def status_value(run_status, findings):
@@ -778,6 +1137,45 @@ def finding_roles(config, findings):
     return routing_for(config, "features_outside_bc") if findings else []
 
 
+def finding_bullet(line):
+    """One finding line as a bullet, with its layer name in front.
+
+    checks.outside_bc_finding writes '<layer>: <count> features are outside
+    ...'. A line that does not have that shape is used exactly as written, for
+    the same reason outside_bc_signature falls back to the whole line: a
+    rewording should still tell somebody rather than tell nobody.
+    """
+    layer, separator, rest = line.partition(":")
+    if not separator or not rest.strip():
+        return line
+    return f"**{layer.strip()} layer** - {rest.strip()}"
+
+
+def finding_blocks(findings):
+    """What an email says about features that cannot be where they are.
+
+    Here rather than in checks.py because checks.py writes one line for a
+    metrics file and a status object, and this is the part that only means
+    anything to somebody reading an email.
+    """
+    if not findings:
+        return []
+    return [
+        heading("Needs attention"),
+        bullets(finding_bullet(line) for line in findings),
+        paragraph(
+            "These features sit well outside the province, so the records are "
+            "wrong wherever they came from. Only the data owner can correct them."
+        ),
+        paragraph(
+            "**Nothing has happened today.** The records have been like this "
+            "all along, and this section will appear on every email until they "
+            "are corrected or removed. It does not affect the result above, and "
+            "it does not stop backups being promoted to the monthly tier."
+        ),
+    ]
+
+
 # What the subject says when a run reports a validity finding. There is one
 # kind of finding today and naming it beats a category word: "data quality
 # findings" told the reader nothing they could act on.
@@ -800,8 +1198,8 @@ def status_subject(record, run_status, findings):
     unread. It said exactly that until 2026-08-19.
 
     So on a run whose status is not itself news, the finding is the news and
-    leads alone; the status is still in the body, in the run block. On a run
-    that failed, the failure leads and the finding follows it, because a
+    leads alone; the status is still in the body, in the table at the top. On
+    a run that failed, the failure leads and the finding follows it, because a
     DATA_FAIL must be visibly a DATA_FAIL in an inbox.
     """
     label = JOB_LABELS[record.job]
@@ -812,51 +1210,34 @@ def status_subject(record, run_status, findings):
     return f"{SUBJECT_PREFIX} {label.capitalize()}: {FINDING_HEADLINE}"
 
 
-# The context that goes under the summary when a run reports a validity
-# finding. It is here rather than in checks.py because checks.py writes one
-# line for a metrics file and a status object, and this is the part that only
-# makes sense in an email.
-FINDING_PARAGRAPHS = (
-    "A water licensed work cannot be outside the province, so those records "
-    "are wrong wherever they came from, and the OBJECTIDs above are what to "
-    "correct them by.",
-    "This part of the report is not about a change and nothing has happened "
-    "today. Every other rule in the check asks whether the data moved since "
-    "yesterday; this one asks whether it can be right at all, so it appears "
-    "on every run until the records are corrected. It does not affect the "
-    "status above, and it does not stop backups being promoted to the "
-    "monthly tier.",
-    "Correcting the records is the data owner's decision. The backup and "
-    "check pipeline only reads these layers - it has changed nothing, and it "
-    "will keep reporting this until the records are put right or removed.",
-)
+# ---------------------------------------------------------------------------
+# The messages themselves
+# ---------------------------------------------------------------------------
 
 
 def status_notification(config, record, findings=()):
     """The alert for one run's status, and everything else that run found.
 
     One email per run rather than one per kind of problem. The summary is
-    carried through exactly as checks.py and backup.py wrote it - both write
-    it for a non-technical reader precisely so that it can be the email body,
-    so rewording or shortening it here would only lose the work (DESIGN.md
-    8.3) - and checks.py already puts its validity findings on the end of it.
-
-    So the finding needs no paragraph of its own here, only the context that
-    belongs in an email rather than in a metrics file, and the recipients
-    widened to include whoever would act on it.
+    carried through as checks.py and backup.py wrote it - both write it for a
+    non-technical reader precisely so that it can be the email body, so
+    rewording it here would only lose the work (DESIGN.md 8.3) - minus the
+    finding checks.py appends to it, which gets a section of its own below.
     """
     run_status = status_of(record)
-    return Notification(
+    return notification(
         key=f"status:{record.job}",
         value=status_value(run_status, findings),
         roles=merge_roles(
             routing_for(config, run_status), finding_roles(config, findings)),
         subject=status_subject(record, run_status, findings),
-        body=message_body([
-            record.payload.get("summary", "(the run wrote no summary)"),
-            *(FINDING_PARAGRAPHS if findings else ()),
-            run_block(config, record),
-        ]),
+        blocks=[
+            at_a_glance(config, record),
+            heading("What happened"),
+            paragraph(summary_of(record)),
+            *finding_blocks(findings),
+            technical(technical_blocks(config, record)),
+        ],
     )
 
 
@@ -886,19 +1267,23 @@ def resolution_notification(config, record, previous, escalated, findings=()):
         finding_roles(config, findings),
     )
     label = JOB_LABELS[record.job]
-    return Notification(
+    was = status_part(previous["value"])
+    return notification(
         key=f"status:{record.job}",
         value=status_value(status_of(record), findings),
         roles=roles,
         subject=f"{SUBJECT_PREFIX} Resolved: {label}",
-        body=message_body([
-            f"The {label} is back to {status_of(record)}. "
-            f"The previous alert reported {status_part(previous['value'])} and "
-            f"nothing further is needed.",
-            record.payload.get("summary", ""),
-            *(FINDING_PARAGRAPHS if findings else ()),
-            run_block(config, record),
-        ]),
+        blocks=[
+            at_a_glance(config, record),
+            heading("Resolved"),
+            paragraph(
+                f"The {label} is back to **{status_of(record)}**. The previous "
+                f"alert reported **{was}**, and nothing further is needed."
+            ),
+            paragraph(summary_of(record)),
+            *finding_blocks(findings),
+            technical(technical_blocks(config, record)),
+        ],
     )
 
 
@@ -921,22 +1306,30 @@ def escalation_notification(config, job, episode, now):
     )
     days = int(episode_days(episode, now))
     label = JOB_LABELS[job]
-    return Notification(
+    return notification(
         key=f"escalation:system_fail:{job}",
         value="escalated",
         roles=roles,
         subject=f"{SUBJECT_PREFIX} The {label} has been failing for {days} days",
-        body=message_body([
-            f"The {label} has failed on every run for {days} days - "
-            f"{len(episode)} runs in a row, the first at "
-            f"{local_text(config, episode[0].moment)}.",
-            "This is an operational failure rather than a problem with the "
-            "data: authentication, object storage or the export service. It "
-            "does mean that for the last few days the backups have not been "
-            "running, which is why this message goes further than the "
-            "original alert did.",
-            run_block(config, episode[-1]),
-        ]),
+        blocks=[
+            table([
+                ("Job", label),
+                ("Result", result_cell("SYSTEM_FAIL")),
+                ("Failing for", f"**{days} days**"),
+                ("Runs failed", f"{len(episode)} in a row"),
+                ("First failure", local_text(config, episode[0].moment)),
+            ]),
+            heading("What this means"),
+            paragraph(
+                "This is an operational problem - signing in, object storage "
+                "or the export service - rather than a problem with the data."
+            ),
+            paragraph(
+                f"**No new backups have been taken for {days} days.** That is "
+                f"why this message goes to more people than the first alert did."
+            ),
+            technical(technical_blocks(config, episode[-1])),
+        ],
     )
 
 
@@ -946,22 +1339,30 @@ def prune_paused_notification(config, episode, now):
     Same one-shot shape as the escalation above and for the same reason.
     """
     days = int(episode_days(episode, now))
-    return Notification(
+    return notification(
         key="prune_paused",
         value="paused",
         roles=routing_for(config, "prune_paused"),
         subject=f"{SUBJECT_PREFIX} Backup pruning has been paused for {days} days",
-        body=message_body([
-            f"Old backups have not been pruned for {days} days, because the "
-            f"most recent integrity check reported DATA_FAIL and pruning "
-            f"pauses while a data incident is open.",
-            "That is deliberate - it stops a live incident from quietly "
-            "evicting the last good copy - but it is not meant to be the "
-            "steady state. The rotating tier keeps growing until the ceiling "
-            "in config.yml is reached. Resolving the check failure resumes "
-            "normal pruning on the next backup run.",
-            run_block(config, episode[-1]),
-        ]),
+        blocks=[
+            table([
+                ("What has stopped", "deleting old backups"),
+                ("Paused for", f"**{days} days**"),
+                ("Why", "the most recent integrity check reported DATA_FAIL"),
+            ]),
+            heading("What this means"),
+            paragraph(
+                "Pruning pauses while a data problem is open, so that a live "
+                "incident cannot quietly remove the last good copy. That is "
+                "deliberate, but it is not meant to last: the daily backups "
+                "keep building up until they reach the limit in config.yml."
+            ),
+            paragraph(
+                "**Fixing the check failure resumes normal pruning** on the "
+                "next backup run."
+            ),
+            technical(technical_blocks(config, episode[-1])),
+        ],
     )
 
 
@@ -978,21 +1379,30 @@ def monthly_candidate_notification(config, record, month):
     The dedup value is the month, so this is one email per month that fails to
     fill rather than one per backup run.
     """
-    return Notification(
+    return notification(
         key="no_monthly_candidate",
         value=month,
         roles=routing_for(config, "no_monthly_candidate"),
         subject=f"{SUBJECT_PREFIX} Nothing promoted to the monthly backup tier for {month}",
-        body=message_body([
-            f"{month} is well under way and no backup has been promoted to "
-            f"the monthly tier. Promotion needs a rotating set whose paired "
-            f"integrity check returned PASS, and no set this month has one.",
-            "The rotating backups are unaffected and are still being taken. "
-            "What is missing is the longer-term monthly copy, which is only "
-            "noticed when somebody goes looking for a restore point from a "
-            "month ago that was never created.",
-            run_block(config, record),
-        ]),
+        blocks=[
+            table([
+                ("Month", month),
+                ("Promoted to the monthly tier", "**nothing**"),
+                ("Daily backups", "unaffected, still being taken"),
+            ]),
+            heading("What this means"),
+            paragraph(
+                f"A backup is promoted to the monthly tier only when its "
+                f"paired integrity check returned PASS, and no set from "
+                f"{month} has one."
+            ),
+            paragraph(
+                "What is missing is the longer-term monthly copy. That is "
+                "normally only noticed when somebody goes looking for a "
+                "restore point from a month ago that was never created."
+            ),
+            technical(technical_blocks(config, record)),
+        ],
     )
 
 
@@ -1006,22 +1416,31 @@ def stale_notification(config, job, slot, records):
     label = JOB_LABELS[job]
     seen = [record for record in records if record.job == job]
     last = local_text(config, seen[-1].moment) if seen else "never"
-    return Notification(
+    return notification(
         key=f"stale:{job}",
         value="stale",
         roles=routing_for(config, "stale"),
         subject=f"{SUBJECT_PREFIX} The {label} did not run",
-        body=message_body([
-            f"The {label} was due at {local_text(config, slot)} and has "
-            f"written no result. The last one to report was {last}.",
-            "A scheduled job that stops running produces the same silence as "
-            "one that keeps passing, so this is checked positively rather "
-            "than waited for. The usual causes are a failed or disabled "
-            "GitHub Actions workflow, expired credentials, or GitHub "
-            "suspending the schedule after a long period of no commits.",
-            "No data is at risk. The backups already taken are untouched; "
-            "what has stopped is the taking of new ones.",
-        ]),
+        blocks=[
+            table([
+                ("Job", label),
+                ("Was due at", local_text(config, slot)),
+                ("Result written", "**none**"),
+                ("Last reported", last),
+            ]),
+            heading("What this means"),
+            paragraph(
+                "A scheduled job that stops running looks exactly like one "
+                "that keeps passing, so this is checked rather than waited "
+                "for. The usual causes are a failed or disabled GitHub Actions "
+                "workflow, expired credentials, or GitHub pausing the schedule "
+                "after a long stretch with no commits."
+            ),
+            paragraph(
+                "**No data is at risk.** The backups already taken are "
+                "untouched. What has stopped is the taking of new ones."
+            ),
+        ],
     )
 
 
@@ -1034,46 +1453,55 @@ def weekly_summary_notification(config, records, history, now, summary_day):
     identically.
     """
     since = now - datetime.timedelta(days=SUMMARY_DAYS)
-    lines = []
+    rows = []
     for job in JOBS:
+        label = JOB_LABELS[job]
         recent = [
             record for record in records_for(history, job) if record.moment >= since
         ]
-        label = JOB_LABELS[job]
         if not recent:
-            lines.append(f"  {label}: no runs in the last {SUMMARY_DAYS} days")
+            rows.append((label, "0", "no runs", "-"))
             continue
         counted = {}
         for record in recent:
             counted[status_of(record)] = counted.get(status_of(record), 0) + 1
-        breakdown = ", ".join(f"{count} {name}" for name, count in sorted(counted.items()))
-        lines.append(
-            f"  {label}: {len(recent)} run(s) - {breakdown}. "
-            f"Most recent {local_text(config, recent[-1].moment)}."
+        breakdown = ", ".join(
+            f"{count} {name}" for name, count in sorted(counted.items())
         )
+        rows.append((
+            label, str(len(recent)), breakdown, local_text(config, recent[-1].moment)
+        ))
 
     overdue = []
     for job in JOBS:
         slot = last_due_slot(config, job, now)
         if slot and is_stale(records, job, slot):
-            overdue.append(f"  {JOB_LABELS[job]}: nothing since the slot at "
-                           f"{local_text(config, slot)}")
+            overdue.append(
+                f"**{JOB_LABELS[job]}** - nothing since the slot at "
+                f"{local_text(config, slot)}"
+            )
 
-    paragraphs = [
-        "Weekly summary for the Water Licensed Works backups.",
-        f"In the last {SUMMARY_DAYS} days:\n" + "\n".join(lines),
+    blocks = [
+        paragraph(
+            f"How the Water Licensed Works backups have been getting on over "
+            f"the last **{SUMMARY_DAYS} days**."
+        ),
+        table(rows, headers=("Job", "Runs", "Results", "Most recent")),
     ]
     if overdue:
-        paragraphs.append("Overdue:\n" + "\n".join(overdue))
+        blocks.append(heading("Overdue"))
+        blocks.append(bullets(overdue))
     else:
-        paragraphs.append("Nothing is overdue. Every expected run has reported.")
+        blocks.append(
+            paragraph("**Nothing is overdue.** Every expected run has reported.")
+        )
 
-    return Notification(
+    return notification(
         key="weekly_summary",
         value=summary_day,
         roles=routing_for(config, "weekly_summary"),
         subject=f"{SUBJECT_PREFIX} Weekly summary, {summary_day}",
-        body=message_body(paragraphs),
+        blocks=blocks,
     )
 
 
@@ -1263,7 +1691,7 @@ def save_state(bucket, config, signals):
 # ---------------------------------------------------------------------------
 
 
-def send_email(config, addresses, subject, body):
+def send_email(config, addresses, subject, body, html=""):
     """Send one message through the internal relay.
 
     Plain SMTP with no authentication and no TLS: this is the government
@@ -1271,6 +1699,11 @@ def send_email(config, addresses, subject, body):
     nowhere else, and it is what the existing staging script has always used.
     If it ever starts requiring credentials that is a change to make
     deliberately rather than a fallback to add now.
+
+    Both versions of the body travel in one message. set_content writes the
+    plain text part and add_alternative adds the formatted one after it, which
+    is the order multipart/alternative requires - a client shows the last part
+    it understands, so an HTML part added first would be the one nobody sees.
     """
     host = os.getenv("SMTP_HOST")
     sender = os.getenv("SMTP_SENDER")
@@ -1285,6 +1718,8 @@ def send_email(config, addresses, subject, body):
     message["To"] = ", ".join(addresses)
     message["Subject"] = subject
     message.set_content(body)
+    if html:
+        message.add_alternative(html, subtype="html")
 
     settings = config["notifications"]
     with smtplib.SMTP(
@@ -1293,7 +1728,7 @@ def send_email(config, addresses, subject, body):
         relay.send_message(message)
 
 
-def deliver(config, notifications, state, addresses, dry_run):
+def deliver(config, notifications, state, addresses, dry_run, html_out=None):
     """Send what has changed, and return the state to record next.
 
     Three rules hold this together.
@@ -1321,11 +1756,16 @@ def deliver(config, notifications, state, addresses, dry_run):
         recipients = addresses_for(notification.roles, addresses)
         if dry_run:
             report_dry_run(notification, recipients)
+            if html_out:
+                write_html_preview(notification, html_out)
             continue
 
         if recipients:
             try:
-                send_email(config, recipients, notification.subject, notification.body)
+                send_email(
+                    config, recipients, notification.subject,
+                    notification.body, notification.html,
+                )
             except Exception as exc:
                 # Not swallowed and not fatal to the rest of the poll: one
                 # unreachable recipient must not stop the other alert going
@@ -1367,6 +1807,10 @@ def report_dry_run(notification, recipients):
     The point of --dry-run is the few days the whole thing is pointed at one
     test address, so this shows the routing and the body in full rather than
     summarising them.
+
+    The plain text version is what gets printed, because it is the one a
+    person can read in a terminal. --html-out writes the formatted version to
+    files, which is how the layout is checked without mailing anybody.
     """
     print("=" * 72)
     print(f"WOULD SEND   {notification.subject}")
@@ -1375,6 +1819,24 @@ def report_dry_run(notification, recipients):
     print(f"dedup key    {notification.key} = {notification.value}")
     print("-" * 72)
     print(notification.body)
+
+
+def write_html_preview(notification, directory):
+    """Save one message's formatted body where a browser can open it.
+
+    Only ever called from a dry run. The formatted version is the one the
+    recipients actually see, and reading it as markup in a terminal is not
+    reading it at all - so wording and layout are reviewed by opening these
+    files rather than by mailing somebody a draft.
+    """
+    folder = Path(directory)
+    folder.mkdir(parents=True, exist_ok=True)
+    # The dedup key names the situation and is unique within one poll, which
+    # is exactly what a file name here wants to be.
+    name = notification.key.replace(":", "-") + ".html"
+    written = folder / name
+    written.write_text(notification.html, encoding="utf-8")
+    print(f"html         {written}")
 
 
 # ---------------------------------------------------------------------------
@@ -1395,7 +1857,7 @@ def load_config(path):
         return yaml.safe_load(handle)
 
 
-def poll(config, bucket, state, now, dry_run):
+def poll(config, bucket, state, now, dry_run, html_out=None):
     """One poll: read the bucket, decide, send. Returns (state, failures)."""
     records = list_status_records(bucket, config)
     history = load_history(bucket, records, now)
@@ -1405,7 +1867,10 @@ def poll(config, bucket, state, now, dry_run):
     )
 
     notifications = collect_notifications(config, records, history, state, now)
-    return deliver(config, notifications, state, role_addresses(config, dry_run), dry_run)
+    return deliver(
+        config, notifications, state, role_addresses(config, dry_run),
+        dry_run, html_out,
+    )
 
 
 def main(argv=None):
@@ -1427,7 +1892,18 @@ def main(argv=None):
             "not written either, so a dry run cannot suppress a real alert."
         ),
     )
+    parser.add_argument(
+        "--html-out", default=None, metavar="DIRECTORY",
+        help=(
+            "With --dry-run, write the formatted version of every message to "
+            "this directory as .html files, to be opened in a browser. Sends "
+            "nothing and writes nothing to object storage."
+        ),
+    )
     arguments = parser.parse_args(argv)
+
+    if arguments.html_out and not arguments.dry_run:
+        parser.error("--html-out is a dry run option. Add --dry-run.")
 
     config = load_config(arguments.config)
     logging.basicConfig(
@@ -1439,7 +1915,9 @@ def main(argv=None):
     state = load_state(bucket, config)
     now = datetime.datetime.now(datetime.timezone.utc)
 
-    updated, failures = poll(config, bucket, state, now, arguments.dry_run)
+    updated, failures = poll(
+        config, bucket, state, now, arguments.dry_run, arguments.html_out
+    )
 
     if arguments.dry_run:
         # Writing it would record as sent something that was never sent, and

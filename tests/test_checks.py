@@ -522,7 +522,7 @@ def test_a_record_outside_bc_is_reported_with_no_history_at_all():
     finding = checks.outside_bc_finding("points", metrics(**OUTLIERS))
 
     assert finding is not None
-    assert "2 feature(s)" in finding
+    assert "2 features are" in finding
     # Naming them is most of the value: whoever reads the alert is whoever
     # would correct the records.
     assert "150984" in finding and "150985" in finding
@@ -593,7 +593,8 @@ def test_both_layers_are_checked():
     finding = checks.outside_bc_finding(
         "lines", metrics(features_outside_grid=1, objectids_outside_grid=[7788]))
 
-    assert finding.startswith("lines: 1 feature(s)")
+    # Singular, because a line a person reads should read like one.
+    assert finding.startswith("lines: 1 feature is")
     assert "OBJECTID 7788" in finding
 
 
@@ -602,7 +603,7 @@ def test_the_layer_and_the_count_lead_the_line():
     the same situation it has already mailed about. tests/test_notify.py holds
     the other half of that contract."""
     finding = checks.outside_bc_finding("points", metrics(**OUTLIERS))
-    assert finding.startswith("points: 2 feature(s)")
+    assert finding.startswith("points: 2 features are")
 
 
 def test_a_third_bad_record_produces_a_different_finding():
@@ -614,7 +615,7 @@ def test_a_third_bad_record_produces_a_different_finding():
         features_outside_grid=3, objectids_outside_grid=[150984, 150985, 151900]))
 
     assert two != three
-    assert "3 feature(s)" in three and "151900" in three
+    assert "3 features are" in three and "151900" in three
 
 
 def test_the_finding_names_a_handful_and_says_how_many_there_are():
@@ -625,7 +626,7 @@ def test_the_finding_names_a_handful_and_says_how_many_there_are():
     finding = checks.outside_bc_finding("points", metrics(
         features_outside_grid=47, objectids_outside_grid=named))
 
-    assert finding.startswith("points: 47 feature(s)")
+    assert finding.startswith("points: 47 features are")
     assert f"the first {checks.MAX_OBJECTIDS_NAMED} of 47" in finding
     assert finding.count("1509") == checks.MAX_OBJECTIDS_NAMED
 
@@ -637,7 +638,7 @@ def test_the_count_is_still_reported_when_the_records_could_not_be_named():
     finding = checks.outside_bc_finding("points", metrics(
         features_outside_grid=2, objectids_outside_grid=[]))
 
-    assert "2 feature(s)" in finding
+    assert "2 features are" in finding
     assert "could not name them" in finding
 
 
@@ -648,7 +649,7 @@ def test_a_large_count_is_still_readable_by_the_notifier():
     finding = checks.outside_bc_finding("points", metrics(
         features_outside_grid=53987, objectids_outside_grid=[1, 2, 3]))
 
-    assert finding.startswith("points: 53,987 feature(s)")
+    assert finding.startswith("points: 53,987 features are")
 
 
 def test_the_finding_reaches_the_summary_that_becomes_the_email_body():

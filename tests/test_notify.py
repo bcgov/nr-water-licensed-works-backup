@@ -93,8 +93,10 @@ def sent(monkeypatch):
     """Every email a test would have sent, recorded instead of relayed."""
     recorded = []
 
-    def record(config, addresses, subject, body):
-        recorded.append({"to": list(addresses), "subject": subject, "body": body})
+    def record(config, addresses, subject, body, html=""):
+        recorded.append({
+            "to": list(addresses), "subject": subject, "body": body, "html": html,
+        })
 
     monkeypatch.setattr(notify, "send_email", record)
     return recorded
@@ -218,6 +220,15 @@ def poll_hourly(entries, start, end, state=None, extra_keys=()):
 def count(sent, fragment):
     """How many of the emails sent carry this fragment in their subject."""
     return sum(1 for message in sent if fragment in message["subject"])
+
+
+def flat(text):
+    """One body with its line breaks taken back out.
+
+    The plain text version is wrapped to a reading pane, so a sentence in it
+    is not a line. These assertions are about the words and not the wrapping.
+    """
+    return " ".join(text.split())
 
 
 def only(sent, fragment):
@@ -514,12 +525,12 @@ def test_the_ordinary_not_promoted_yet_line_is_not_an_alert(sent):
 # 4, and for a third appearing. The contract test at the foot of this file
 # builds them from checks.py rather than trusting these copies.
 OUTSIDE_BC = (
-    "points: 2 feature(s) fall outside British Columbia entirely - "
-    "OBJECTID 150984, 150985."
+    "points: 2 features are outside British Columbia "
+    "(OBJECTID 150984, 150985)."
 )
 OUTSIDE_BC_THIRD = (
-    "points: 3 feature(s) fall outside British Columbia entirely - "
-    "OBJECTID 150984, 150985, 151900."
+    "points: 3 features are outside British Columbia "
+    "(OBJECTID 150984, 150985, 151900)."
 )
 
 # What the subject carries when a run reports one. The counts and the
@@ -549,13 +560,13 @@ def test_a_finding_rides_in_the_run_s_own_email(sent):
         f"{notify.SUBJECT_PREFIX} Daily integrity check: "
         f"features recorded outside British Columbia")
     assert "BASELINE" not in alert["subject"]
-    assert "Status:  BASELINE" in alert["body"]
-    assert "2 feature(s)" in alert["body"]
+    assert "BASELINE" in alert["body"]
+    assert "2 features are" in alert["body"]
     assert "150984" in alert["body"] and "150985" in alert["body"]
     # The context that only makes sense in an email, and the sentence that
     # stops a reader assuming their backups have stopped being promoted.
-    assert "does not stop backups being promoted" in alert["body"]
-    assert "Correcting the records is the data owner's decision" in alert["body"]
+    assert "does not stop backups being promoted" in flat(alert["body"])
+    assert "Only the data owner can correct them" in flat(alert["body"])
     # The status alone would have reached the developer. The finding widens it
     # to the people who would correct the records.
     assert sorted(alert["to"]) == sorted(
@@ -619,8 +630,8 @@ def test_a_third_bad_record_is_a_second_email(sent):
         message["body"] for message in sent if FINDINGS_SUBJECT in message["subject"]
     ]
     assert len(bodies) == 2
-    assert "2 feature(s)" in bodies[0] and "151900" not in bodies[0]
-    assert "3 feature(s)" in bodies[1] and "151900" in bodies[1]
+    assert "2 features are" in bodies[0] and "151900" not in bodies[0]
+    assert "3 features are" in bodies[1] and "151900" in bodies[1]
 
 
 def test_a_status_change_while_a_finding_is_open_is_one_email_not_two(sent):
@@ -641,13 +652,13 @@ def test_a_status_change_while_a_finding_is_open_is_one_email_not_two(sent):
 
     # Two emails, one per run that reported something new, and never two
     # about the same run. Neither subject carries a status, so they read the
-    # same and the run block tells them apart.
+    # same and the table at the top of the body tells them apart.
     bodies = [
         message["body"] for message in sent if FINDINGS_SUBJECT in message["subject"]
     ]
     assert len(bodies) == 2
-    assert "Status:  BASELINE" in bodies[0]
-    assert "Status:  PASS" in bodies[1]
+    assert "BASELINE" in bodies[0]
+    assert "PASS" in bodies[1] and "BASELINE" not in bodies[1]
 
 
 def test_a_clean_run_says_nothing_about_findings(sent):
@@ -689,7 +700,7 @@ def test_both_layers_appear_in_one_email(sent):
     """One situation, one message. Lines going bad while points already is
     changes the value, so it is a second email rather than a silent addition
     to one already sent."""
-    lines_too = "lines: 1 feature(s) fall outside British Columbia entirely - OBJECTID 7788."
+    lines_too = "lines: 1 feature is outside British Columbia (OBJECTID 7788)."
     entries = [
         run("checks", at(day, 2, 6), "PASS", details=[OUTSIDE_BC]) for day in (18, 19)
     ]
@@ -708,8 +719,8 @@ def test_both_layers_appear_in_one_email(sent):
     assert "lines:" not in bodies[0]
     # Both layers, each as its own line, so the OBJECTIDs stay next to the
     # layer they belong to.
-    assert "lines: 1 feature(s)" in bodies[1]
-    assert "points: 2 feature(s)" in bodies[1]
+    assert "lines layer - 1 feature is" in bodies[1]
+    assert "points layer - 2 features are" in bodies[1]
 
 
 def test_an_incident_clearing_while_a_finding_is_open_sends_one_resolution(sent):
@@ -742,11 +753,11 @@ def test_an_incident_clearing_while_a_finding_is_open_sends_one_resolution(sent)
     # The resolution names the status that was alerting, not the composite
     # value the state happens to store it under.
     resolution = only(sent, "Resolved")
-    assert "reported DATA_FAIL and" in resolution["body"]
+    assert "previous alert reported DATA_FAIL" in flat(resolution["body"])
     # And the finding is still in front of the reader, because it is still
     # true - the incident cleared, the invalid records did not.
     assert "150984" in resolution["body"]
-    assert "does not stop backups being promoted" in resolution["body"]
+    assert "does not stop backups being promoted" in flat(resolution["body"])
 
 
 def test_the_dedup_value_is_the_bare_status_when_there_is_no_finding():
@@ -861,7 +872,7 @@ def test_the_weekly_summary_fires_once_on_monday(sent):
     summary = only(sent, "Weekly summary")
     assert "2026-08-24" in summary["subject"]
     assert sorted(summary["to"]) == sorted(ADDRESSES.values())
-    assert "Nothing is overdue" in summary["body"]
+    assert "Nothing is overdue" in flat(summary["body"])
 
 
 def test_the_summary_does_not_fire_before_the_configured_hour(sent):
@@ -970,8 +981,8 @@ def test_the_summary_is_the_body_and_is_not_reworded(sent):
 
     poll_hourly(entries, at(19, 3), at(19, 8))
 
-    body = only(sent, "DATA_FAIL")["body"]
-    assert body.startswith(summary)
+    body = flat(only(sent, "DATA_FAIL")["body"])
+    assert summary in body
     assert "no data has been changed" in body.lower()
 
 
@@ -984,10 +995,174 @@ def test_the_details_and_the_run_facts_are_carried_into_the_body(sent):
 
     poll_hourly(entries, at(19, 3), at(19, 8))
 
-    body = only(sent, "WARN")["body"]
+    body = flat(only(sent, "WARN")["body"])
     assert "extent drift 6,200 m exceeds 5,000 m" in body
     assert "46d2f13" in body
     assert "not a GitHub Actions run" in body
+
+
+# ---------------------------------------------------------------------------
+# How a message reads
+#
+# The recipients are a data owner, a shared mailbox and a developer, and only
+# the last of those is paid to decode a status object. So the shape of the
+# message is a requirement rather than a decoration: what happened, then what
+# needs a person, then the reassurance, and only then the run identifiers.
+# ---------------------------------------------------------------------------
+
+
+def every_message(sent):
+    """Every message a poll sent, which several of these check all of."""
+    assert sent, "the fixture sent nothing, so this test asserts nothing"
+    return sent
+
+
+def busy_week():
+    """A week with something of every kind in it: a failure, a finding, a
+    resolution, a backup, and a gap wide enough to go stale."""
+    entries = [
+        run("checks", at(18, 2, 6), "DATA_FAIL", "Points feature count fell 14%.",
+            details=["points count fell 14%", OUTSIDE_BC]),
+        run("checks", at(19, 2, 6), "PASS", "No unexpected change.",
+            details=[OUTSIDE_BC]),
+    ]
+    entries += [run("backup", at(day, 4, 40), "PASS") for day in (18, 20)]
+    return entries
+
+
+def test_every_message_opens_by_saying_it_was_sent_automatically(sent):
+    """The first question an automated email raises is whether a person sent
+    it, and it used to be answered by one line at the very bottom. It is now
+    the first thing in the message and it is highlighted, which is the whole
+    of why the HTML version exists."""
+    poll_hourly(busy_week(), at(18, 3), at(21, 3))
+
+    for message in every_message(sent):
+        assert message["body"].startswith("*** Sent automatically by the ")
+        assert "Sent automatically" in message["body"]
+        # Highlighted rather than merely present. The background colour is
+        # the point, so a version of this that dropped it should fail.
+        assert notify.BANNER_STYLE in message["html"]
+
+
+def test_no_message_says_the_gis_server(sent):
+    """Which server the job runs on is ours and not the reader's. It said so
+    in the footer of every message until 2026-08-25."""
+    poll_hourly(busy_week(), at(18, 3), at(21, 3))
+
+    for message in every_message(sent):
+        assert "GIS server" not in message["body"]
+        assert "GIS server" not in message["html"]
+
+
+def test_every_message_carries_both_versions_of_its_body(sent):
+    """One list of blocks renders twice, so the formatted version and the
+    fallback cannot say different things. A client that cannot show HTML gets
+    a message that still reads as a message rather than as markup."""
+    poll_hourly(busy_week(), at(18, 3), at(21, 3))
+
+    for message in every_message(sent):
+        assert message["html"].startswith("<html>")
+        # The markers are how bold is written and they are for the renderer,
+        # not for the reader. The banner's own asterisks are its decoration in
+        # the text version, so the body is checked from after it.
+        assert "**" not in message["body"].split("***", 2)[-1]
+        assert "<strong>" in message["html"]
+
+
+def test_the_run_identifiers_come_after_everything_a_reader_needs(sent):
+    """The data owner and the shared inbox are on most of these. A run id and
+    a commit hash in the middle of a message about their data is noise that
+    makes the part they can act on harder to find, so all of it sits at the
+    foot behind its own heading."""
+    poll_hourly(busy_week(), at(18, 3), at(21, 3))
+
+    body = only(sent, "DATA_FAIL")["body"]
+    assert notify.TECHNICAL_HEADING in body
+    assert body.index("Points feature count fell 14%.") < body.index(notify.TECHNICAL_HEADING)
+    assert body.index("Nothing has been changed.") < body.index(notify.TECHNICAL_HEADING)
+    assert body.index("46d2f13") > body.index(notify.TECHNICAL_HEADING)
+
+
+def test_a_finding_is_reported_once_and_not_twice(sent):
+    """checks.py appends the finding to the summary so that the line is
+    complete wherever it is read. An email gives it a section of its own, so
+    the summary is cut at the lead-in - without which the reader is told the
+    same thing twice in four lines."""
+    summary = checks.summarise(
+        "PASS", "2026-08-20",
+        {"points": {"feature_count": 53993}}, [], [OUTSIDE_BC],
+    )
+    entries = [run("checks", at(19, 2, 6), "PASS", summary, details=[OUTSIDE_BC])]
+    entries += [run("backup", at(20, 4, 40), "PASS")]
+
+    poll_hourly(entries, at(19, 3), at(19, 8))
+
+    body = only(sent, FINDINGS_SUBJECT)["body"]
+    assert "in line with recent runs" in body
+    assert checks.FINDING_LEAD_IN.strip() not in body
+    # Once in the section that explains it, once in the raw lines at the foot
+    # of the message, and nowhere else.
+    assert body.count("150984") == 2
+
+
+def test_the_finding_lead_in_matches_what_checks_py_writes():
+    """The other half of the contract, built from the real function rather
+    than from a copy of its wording. A rewording in one file and not the other
+    leaves the finding printed twice, which is not silent but is not right
+    either."""
+    assert notify.FINDING_LEAD_IN == checks.FINDING_LEAD_IN
+
+    summary = checks.summarise(
+        "BASELINE", "2026-08-20",
+        {"points": {"feature_count": 53993}}, [], [OUTSIDE_BC],
+    )
+    record = notify.StatusRecord(
+        job="checks", moment=at(19, 2, 6), key="status/x.json",
+        payload={"status": "BASELINE", "summary": summary},
+    )
+    cut = notify.summary_of(record)
+    assert cut.endswith("possible until the next run.")
+    assert "150984" not in cut
+
+
+def test_html_is_escaped_rather_than_pasted_in():
+    """Nothing in these messages comes from a stranger, but a summary is free
+    text written by another module and an ampersand in one should not be able
+    to break the markup."""
+    record = notify.StatusRecord(
+        job="checks", moment=at(19, 2, 6), key="status/x.json",
+        payload={
+            "status": "WARN",
+            "summary": "Counts <fell> sharply & the extent moved.",
+            "code_version": "46d2f13",
+        },
+    )
+    message = notify.status_notification(CONFIG, record)
+
+    assert "&lt;fell&gt;" in message.html
+    assert "&amp;" in message.html
+    assert "<fell>" not in message.html
+    # And the reader of the text version sees what was written.
+    assert "Counts <fell> sharply & the extent moved." in message.body
+
+
+def test_the_weekly_summary_is_a_table_a_person_can_scan(sent):
+    """It is the one message that reports several things at once, which is
+    exactly the shape prose is worst at."""
+    entries = passing_week()
+
+    state = {
+        "weekly_summary": {"value": "2026-08-17", "roles": [], "sent_utc": stamp(at(17, 15))}
+    }
+
+    poll_hourly(entries, at(24, 0), at(25, 0), state=state)
+
+    summary = only(sent, "Weekly summary")
+    assert "Job" in summary["body"] and "Runs" in summary["body"]
+    assert "daily integrity check" in summary["body"]
+    assert "<table" in summary["html"] and "<th" in summary["html"]
+
 
 
 # ---------------------------------------------------------------------------
@@ -1034,7 +1209,7 @@ def test_a_failed_send_is_retried_rather_than_recorded(monkeypatch):
     worse than sending it twice."""
     attempts = []
 
-    def refuse(config, addresses, subject, body):
+    def refuse(config, addresses, subject, body, html=""):
         attempts.append(subject)
         raise OSError("the relay is unreachable")
 
@@ -1054,7 +1229,7 @@ def test_one_unreachable_recipient_does_not_stop_the_other_alert(monkeypatch):
     swallow the other."""
     delivered = []
 
-    def sometimes(config, addresses, subject, body):
+    def sometimes(config, addresses, subject, body, html=""):
         if "DATA_FAIL" in subject:
             raise OSError("the relay is unreachable")
         delivered.append(subject)
@@ -1301,7 +1476,7 @@ def test_a_line_the_signature_cannot_parse_still_produces_one_email():
     """A reworded message should produce one email rather than none, and
     rather than one an hour. The line itself is stable while the situation
     is, so it stands in as the value."""
-    reworded = "something fall outside British Columbia entirely, somehow"
+    reworded = "something is outside British Columbia, somehow"
     assert notify.outside_bc_signature([reworded]) == reworded
 
 

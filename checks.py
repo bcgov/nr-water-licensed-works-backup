@@ -1193,19 +1193,22 @@ def outside_bc_finding(layer_key, current):
     object_ids = current.get("objectids_outside_grid") or []
     named = ", ".join(str(object_id) for object_id in object_ids)
     if not named:
-        which = "and this run could not name them"
+        which = "this run could not name them"
     elif outside > len(object_ids):
-        which = f"OBJECTID {named} (the first {len(object_ids)} of {outside:,})"
+        which = f"OBJECTID {named} - the first {len(object_ids)} of {outside:,}"
     else:
         which = f"OBJECTID {named}"
+
+    # Written as the sentence a reader would say out loud, because this line
+    # is read by the data owner in an email and not only by us in a log.
+    subject = "feature is" if outside == 1 else "features are"
 
     # The layer and the count lead the line, and jenkins/notify.py reads both
     # back out of it to decide whether this is the same situation it has
     # already mailed about. That parse is a contract between the two files and
     # tests/test_notify.py builds this line from here to prove it holds.
     return (
-        f"{layer_key}: {outside:,} feature(s) fall outside British Columbia "
-        f"entirely - {which}."
+        f"{layer_key}: {outside:,} {subject} outside British Columbia ({which})."
     )
 
 
@@ -1299,6 +1302,12 @@ def status_from(violations, has_comparison):
     return "PASS"
 
 
+# What separates a run's verdict from a validity finding in the summary
+# line. Short and plain on purpose: "Separately, and needing no comparison to
+# be true" was accurate and nobody could read it.
+FINDING_LEAD_IN = " Also flagged: "
+
+
 def summarise(status, date_stamp, metrics, violations, findings=()):
     """One line for a non-technical reader, which becomes the email body.
 
@@ -1345,9 +1354,13 @@ def summarise(status, date_stamp, metrics, violations, findings=()):
         # no verdict is possible until there is something to compare against,
         # and PASS says nothing changed; a validity finding is the exception
         # to both, and has to read as one rather than as a contradiction.
-        text += (
-            " Separately, and needing no comparison to be true - " + " ".join(findings)
-        )
+        #
+        # FINDING_LEAD_IN is also where jenkins/notify.py cuts the summary,
+        # because an email gives the finding a section of its own and would
+        # otherwise print it twice. Reword it in both files or in neither -
+        # tests/test_notify.py builds a real summary from here and asserts
+        # that the split still works.
+        text += FINDING_LEAD_IN + " ".join(findings)
     return text
 
 
