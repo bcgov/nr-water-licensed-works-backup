@@ -211,7 +211,23 @@ schedule:
   # because the Friday-to-Monday backup gap is 72 hours by design.
   # Rule: once an expected slot has passed, allow this much grace before
   # treating a missing result as a failure.
-  checks_grace_hours: 2
+  #
+  # The check grace was 2 until 2026-08-28, and it was sized against
+  # "Actions can start a cron late but never early" with no figure attached.
+  # There is a figure now: the check job ran 26-32 minutes late every day
+  # from 19 to 26 August, then 107 minutes, then 165. The 165 was 45 minutes
+  # past the grace, so a poll landed in the gap and reported a stopped
+  # pipeline for a run that was merely late and went on to PASS. Four hours
+  # covers what has actually been observed with headroom, and the cost is two
+  # more hours before a genuinely stopped daily job is reported - which on a
+  # job that runs in the evening and is read in the morning is no cost at all.
+  #
+  # Raise it again if Actions keeps slipping, but look at the local-midnight
+  # margin first: both jobs stamp their output with the LOCAL date, so a
+  # backup delayed past three hours files itself under the wrong day and
+  # stops pairing with the check that covered it. That breaks something;
+  # this only sends an email.
+  checks_grace_hours: 4
   backup_grace_hours: 6
 
 

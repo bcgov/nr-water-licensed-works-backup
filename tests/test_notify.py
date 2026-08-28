@@ -825,21 +825,43 @@ def test_the_backup_grace_period_is_respected(sent):
     assert count(sent, "did not run") == 0
 
 
-def test_a_missed_check_slot_alerts_after_two_hours(sent):
-    """The check grace is two hours, which is only enforceable because this
-    job polls hourly. A job that looked once a day could not detect it at
-    all (DESIGN.md 8.5)."""
+def test_a_missed_check_slot_alerts_after_the_grace_period(sent):
+    """The check grace is four hours, which is only enforceable because this
+    job polls hourly. A job that looked once a day could not detect it at all
+    (DESIGN.md 8.5).
+
+    The boundary is pinned from both sides on purpose. It was two hours until
+    2026-08-28, when a run that started 165 minutes late tripped this and
+    then passed; the test that stood here polled from 04:00 and would have
+    kept passing at any grace up to eight hours, so it asserted the alert but
+    not the threshold. This one stays quiet up to 05:30 and fires at 06:00 and
+    no later, so the setting cannot move in either direction without failing
+    here. The boundary is inclusive - last_due_slot asks now >= slot + grace.
+    """
     entries = [run("checks", at(day, 2, 6), "PASS") for day in (22, 23)]
     entries += [run("backup", at(day, 4, 40), "PASS") for day in (22, 25)]
 
-    # The 2026-08-24 02:00 UTC slot is overdue from 04:00 UTC.
-    poll_hourly(entries, at(23, 3), at(24, 3, 30))
+    # The 2026-08-24 02:00 UTC slot is overdue from 06:00 UTC.
+    poll_hourly(entries, at(23, 3), at(24, 5, 30))
     before = count(sent, "integrity check did not run")
-    poll_hourly(entries, at(24, 4), at(24, 12), state=quiet_state(at(23, 3)))
+    poll_hourly(entries, at(24, 6), at(24, 6, 30), state=quiet_state(at(23, 3)))
     after = count(sent, "integrity check did not run")
 
     assert before == 0
     assert after == 1
+
+
+def test_a_check_run_late_but_inside_the_grace_is_not_stale(sent):
+    """The case that produced the change. A run for the 02:00 slot that does
+    not write its status object until 04:47 is late, not stopped, and the
+    hourly polls across that window must stay quiet."""
+    entries = [run("checks", at(23, 2, 6), "PASS"), run("backup", at(22, 4, 40), "PASS")]
+    # The 2026-08-24 slot, covered at 04:47 - past the old two-hour grace.
+    entries.append(run("checks", at(24, 4, 47), "PASS"))
+
+    poll_hourly(entries, at(24, 3), at(24, 12))
+
+    assert count(sent, "integrity check did not run") == 0
 
 
 def test_staleness_is_one_email_however_long_the_pipeline_stays_down(sent):
