@@ -1,9 +1,16 @@
 """Entry point for the scheduled daily check job.
 
     python run_checks.py
+    python run_checks.py --config spec/drill/config.drill.yml
 
-Reads config.yml, runs one set of integrity checks, prints what happened and
-exits 0 or 1.
+Reads a configuration file, runs one set of integrity checks, prints what
+happened and exits 0 or 1.
+
+The --config argument exists for the drills (DESIGN.md 7.8.3), which need a
+test configuration naming the test items and a SEPARATE STORAGE PREFIX -
+sharing the production one would write deliberately damaged measurements into
+metrics/, where the next real check would compare against them. It defaults to
+config.yml, which is what the scheduled workflow runs.
 
 The exit code is deliberately not a copy of the status. PASS, BASELINE and
 WARN all exit 0: a WARN is below the action threshold by definition, and a
@@ -28,6 +35,7 @@ A run takes roughly six minutes, nearly all of it the 1,020 spatial grid
 queries per layer.
 """
 
+import argparse
 import logging
 import sys
 
@@ -37,7 +45,7 @@ import checks
 import status
 import storage
 
-CONFIG_PATH = "config.yml"
+DEFAULT_CONFIG_PATH = "config.yml"
 
 # DATA_FAIL is a data problem and SYSTEM_FAIL is an operational one. Both
 # mean this run did not deliver a clean check, so both fail the step.
@@ -50,8 +58,25 @@ def load_config(path):
         return yaml.safe_load(handle)
 
 
-def main():
-    config = load_config(CONFIG_PATH)
+def parse_arguments(argv):
+    parser = argparse.ArgumentParser(
+        description="Run one set of integrity checks."
+    )
+    parser.add_argument(
+        "--config", default=DEFAULT_CONFIG_PATH,
+        help=(
+            "Path to the configuration file (default: config.yml). The "
+            "drills point this at a test configuration naming the test "
+            "items and a separate storage prefix, so that deliberately "
+            "damaged measurements never land in the production history. "
+            "DESIGN.md 7.8.3."
+        ),
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    config = load_config(parse_arguments(argv).config)
     logging.basicConfig(
         level=config.get("logging", {}).get("level", "INFO"),
         format="%(asctime)s %(levelname)-7s %(message)s",

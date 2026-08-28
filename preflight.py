@@ -8,6 +8,7 @@ new maintainer sets up their environment, and as the first step in
 diagnosing a SYSTEM_FAIL:
 
     python preflight.py
+    python preflight.py --config spec/drill/config.drill.yml
 
 Read-only against AGOL. It authenticates, reads layer definitions and runs
 count and extent queries. It does not export, and it writes nothing to AGOL
@@ -23,6 +24,7 @@ repository is public and may run in a workflow whose logs are world
 readable. Presence and outcomes only.
 """
 
+import argparse
 import datetime
 import json
 import logging
@@ -37,7 +39,7 @@ from arcgis.features import FeatureLayerCollection
 from arcgis.gis import GIS
 from botocore.exceptions import ClientError
 
-CONFIG_PATH = "config.yml"
+DEFAULT_CONFIG_PATH = "config.yml"
 
 REQUIRED_ENV = [
     "S3_NRS_ENDPOINT",
@@ -635,8 +637,23 @@ def report(results):
     return 0
 
 
-def main():
-    config = load_config(CONFIG_PATH)
+def parse_arguments(argv):
+    parser = argparse.ArgumentParser(
+        description="Check this environment can run the pipeline. Read-only."
+    )
+    parser.add_argument(
+        "--config", default=DEFAULT_CONFIG_PATH,
+        help=(
+            "Path to the configuration file (default: config.yml). Point "
+            "it at the drill configuration to capture the state of the "
+            "test copies before and after damage. DESIGN.md 7.8.2."
+        ),
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    config = load_config(parse_arguments(argv).config)
     logging.basicConfig(
         level=config.get("logging", {}).get("level", "INFO"), format="%(message)s"
     )

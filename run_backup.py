@@ -1,10 +1,14 @@
 """Entry point for the scheduled backup job.
 
     python run_backup.py
+    python run_backup.py --config spec/drill/config.drill.yml
 
-Reads config.yml, runs one backup, prints what happened and exits 0 on
-success or 1 on failure so that a workflow step fails visibly rather than
+Reads a configuration file, runs one backup, prints what happened and exits 0
+on success or 1 on failure so that a workflow step fails visibly rather than
 going green on a failed run.
+
+The --config argument exists for the drills (DESIGN.md 7.8.3) and defaults to
+config.yml, which is what the scheduled workflow runs.
 
 The run is long: two exports, measured at 22.6 and 54.5 minutes, so an hour
 and a half of mostly waiting is a normal run rather than a hung one.
@@ -15,6 +19,7 @@ staleness rule in DESIGN.md 8.2 treats an expected slot with nothing new
 under status/ as a stopped pipeline.
 """
 
+import argparse
 import logging
 import sys
 
@@ -24,7 +29,7 @@ import backup
 import status
 import storage
 
-CONFIG_PATH = "config.yml"
+DEFAULT_CONFIG_PATH = "config.yml"
 
 
 def load_config(path):
@@ -33,8 +38,21 @@ def load_config(path):
         return yaml.safe_load(handle)
 
 
-def main():
-    config = load_config(CONFIG_PATH)
+def parse_arguments(argv):
+    parser = argparse.ArgumentParser(description="Run one backup.")
+    parser.add_argument(
+        "--config", default=DEFAULT_CONFIG_PATH,
+        help=(
+            "Path to the configuration file (default: config.yml). The "
+            "drills point this at a test configuration naming the test "
+            "items and a separate storage prefix. DESIGN.md 7.8.3."
+        ),
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    config = load_config(parse_arguments(argv).config)
     logging.basicConfig(
         level=config.get("logging", {}).get("level", "INFO"),
         format="%(asctime)s %(levelname)-7s %(message)s",
