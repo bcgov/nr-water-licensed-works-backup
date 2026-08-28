@@ -24,6 +24,8 @@ Everything here is **read-only** with respect to the production feature layers. 
 
 Restore procedures are documented runbooks carried out by a person. Any tooling written to support them stays outside the pipeline, is never referenced by a workflow, and requires explicit arguments and typed confirmation.
 
+`restore/restore_layer.py` is that tooling, and the exception that proves the rule above: it is the one file here that can delete a feature. It is a resource for the data owner, not part of anything scheduled. Nothing imports it, no workflow can reach it, it reads no configuration and holds no object storage credentials, it authenticates only through `AGO_USERNAME_RESTORE` / `AGO_PASSWORD_RESTORE` rather than the pipeline's own credentials, it verifies the artifact's checksum before it deletes anything, and it changes nothing without `--execute` and a typed confirmation. The two production items are refused outright unless the run explicitly names who approved it. `tests/test_restore.py` asserts each of those as a property rather than trusting them as a convention. The procedure is [docs/RESTORE_inplace.md](docs/RESTORE_inplace.md).
+
 
 ## How it works
 
@@ -90,6 +92,7 @@ run_backup.py         entry point
 run_checks.py         entry point
 preflight.py          read-only environment and assumption check
 jenkins/              notification job, with its own short requirements.txt
+restore/              manual restore tool; not part of the pipeline, imported by nothing
 tests/                known-answer tests for the check rules
 docs/                 restore runbooks and guides
 .github/workflows/    scheduled jobs
