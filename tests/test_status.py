@@ -109,7 +109,7 @@ def test_the_status_object_is_the_shape_the_notifier_reads():
 
     assert set(written) == {
         "run_id", "job", "status", "timestamp_utc",
-        "summary", "details", "code_version", "workflow_run_url",
+        "summary", "details", "rules", "code_version", "workflow_run_url",
     }
     assert written["run_id"] == "checks-2026-08-14T23:05:00Z"
     assert written["job"] == "checks"
@@ -383,3 +383,30 @@ def test_both_jobs_take_the_shared_helpers_from_status():
             if isinstance(node, ast.FunctionDef)
         }
         assert defined & shared == set(), f"{name} still defines its own copy"
+
+
+def test_the_broken_rules_are_names_only_sorted_and_deduplicated():
+    """What jenkins/notify.py deduplicates on since 2026-09-02.
+
+    feature_count fires against the previous run and against the trend median
+    in the same run, and for the purpose of asking whether the character of a
+    failure has changed those are one rule, not two. Names only: a message
+    carries counts and cell names that move every day, and a value that moves
+    every day is a daily email.
+    """
+    result = check_result("DATA_FAIL")
+    result.metrics["failures"] = [
+        {"layer": "points", "rule": "feature_count", "comparison": "previous check"},
+        {"layer": "points", "rule": "bin_count_change", "comparison": "daily"},
+        {"layer": "points", "rule": "feature_count", "comparison": "30-day median"},
+    ]
+
+    assert status.broken_rules(result) == ["bin_count_change", "feature_count"]
+
+
+def test_a_run_with_no_metrics_reports_no_broken_rules():
+    """A SYSTEM_FAIL returns before the measurements are collected, and a
+    backup result has no metrics at all. Both read as nothing broken, which
+    for a run that reached no verdict is the honest answer."""
+    assert status.broken_rules(backup_result()) == []
+    assert status.build_status(status.CHECKS_JOB, check_result(), AFTERNOON)["rules"] == []

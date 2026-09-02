@@ -1099,32 +1099,66 @@ def technical_blocks(config, record):
     return blocks
 
 
-def status_value(run_status, findings):
+def status_value(run_status, findings, rules=()):
     """The dedup value for a status: entry.
 
-    The run status on its own when the check found nothing invalid, which is
-    what it has always been - so every state entry already in the bucket and
-    every count test written for Step 6 compares exactly as before.
+    Three things decide whether mail goes out, and each of them is here
+    because leaving it out made somebody miss something.
 
-    With a finding it also carries what that finding currently is. That is
-    what makes one email go out when the status changes AND one go out when a
-    new bad record appears on a day the status did not move. The second of
-    those is not a nicety: a healthy run is a PASS, PASS routes to nobody, so
-    without it a third bad record on a passing day would reach no one, which
-    is the silence DESIGN.md 7.6.1 was written about.
+    THE RUN STATUS, which is what it has always been.
+
+    WHAT THE VALIDITY FINDING CURRENTLY IS, so that a new bad record produces
+    an email on a day the status did not move. Not a nicety: a healthy run is
+    a PASS, PASS routes to nobody, so without it a third bad record on a
+    passing day would reach no one - the silence DESIGN.md 7.6.1 was written
+    about.
+
+    AND THE NAMES OF THE RULES THAT BROKE, added 2026-09-02 after the drill
+    showed the status alone cannot tell two different failures apart. A map
+    cell emptying and the feature count collapsing are both DATA_FAIL, so the
+    second sent nothing and the reader was left believing nothing had changed
+    since the first.
+
+    Names only, and read from the status object rather than parsed back out of
+    the prose in `details`. They carry no counts and no cell names, so they
+    hold still for as long as an incident does - and every day of an open
+    incident compares against the same pre-incident baseline, because
+    `previous_run` skips DATA_FAIL days, so the same rules fire each time.
+    That is what keeps this from becoming the daily email DESIGN.md 8.5 exists
+    to prevent.
     """
-    if not findings:
-        return run_status
-    return f"{run_status} + {outside_bc_signature(findings)}"
+    parts = [run_status]
+    if rules:
+        parts.append(f"[{','.join(rules)}]")
+    if findings:
+        parts.append(f"+ {outside_bc_signature(findings)}")
+    return " ".join(parts)
+
+
+def broken_rules(record):
+    """The rule names a run recorded, or none.
+
+    Written by status.build_status since 2026-09-02. Absent on every status
+    object older than that and on every backup run, and an absent field reads
+    as no rules broken - which is what lets an entry already in the bucket be
+    compared without a migration, and what keeps this working if the field is
+    ever dropped again.
+    """
+    rules = record.payload.get("rules")
+    return [str(rule) for rule in rules] if isinstance(rules, list) else []
 
 
 def status_part(value):
-    """The run status out of a status: value that may also carry a finding.
+    """The run status out of a status: value that may also carry rules and a
+    finding.
 
     Used wherever a recorded value is compared against the five statuses. A
-    status never contains ' + ', so the split is unambiguous.
+    status is one word, so taking the first is unambiguous however much is
+    appended after it - and that stays true for values written before the
+    rules were added, which is what lets an entry already in the bucket be
+    compared without a migration.
     """
-    return str(value).split(" + ", 1)[0]
+    return str(value).split(" ", 1)[0]
 
 
 def finding_roles(config, findings):
@@ -1227,7 +1261,7 @@ def status_notification(config, record, findings=()):
     run_status = status_of(record)
     return notification(
         key=f"status:{record.job}",
-        value=status_value(run_status, findings),
+        value=status_value(run_status, findings, broken_rules(record)),
         roles=merge_roles(
             routing_for(config, run_status), finding_roles(config, findings)),
         subject=status_subject(record, run_status, findings),

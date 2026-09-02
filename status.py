@@ -258,6 +258,16 @@ def build_status(job, result, moment):
     the measurements have their own file under metrics/, and this object is
     read hourly by a job whose whole point is that it stays small.
 
+    `rules` is the exception to that, added 2026-09-02, and it is the names
+    only. The drill found that two genuinely different failures - a map cell
+    emptied on one run, the feature count collapsing on the next - are
+    indistinguishable to the notify job, which deduplicates on the status and
+    therefore sent nothing for the second. The names are what tell them apart,
+    and putting them here rather than parsing them back out of the prose in
+    `details` is the difference between a contract and a guess. They carry no
+    numbers, so they do not move while an incident is open, which is what
+    keeps this from becoming a daily email. DESIGN.md 8.5.
+
     The notify job reads this shape directly, so a field added here is a field
     jenkins/notify.py may come to depend on.
     """
@@ -268,9 +278,31 @@ def build_status(job, result, moment):
         "timestamp_utc": utc_stamp(moment),
         "summary": result.summary,
         "details": list(result.details),
+        "rules": broken_rules(result),
         "code_version": result.code_version,
         "workflow_run_url": workflow_run_url(),
     }
+
+
+def broken_rules(result):
+    """The names of the rules a check run broke, sorted and without repeats.
+
+    Names only, and taken from the structured failures in the metrics rather
+    than from the prose: `feature_count` fires against the previous run and
+    against the trend median in the same run, and both are the same rule for
+    the purpose of asking whether the character of a failure has changed.
+
+    Empty for a backup run, which measures nothing about the data, and for any
+    result whose metrics never got as far as being collected - a SYSTEM_FAIL
+    returns before that, and an absent field reads the same as no rules broken,
+    which for a run that reached no verdict is the honest answer.
+    """
+    metrics = getattr(result, "metrics", None) or {}
+    return sorted({
+        failure["rule"]
+        for failure in metrics.get("failures", [])
+        if isinstance(failure, dict) and failure.get("rule")
+    })
 
 
 def write_status(store, config, job, result):

@@ -116,7 +116,7 @@ def at(day, hour, minute=0, month=8):
     return datetime.datetime(2026, month, day, hour, minute, tzinfo=UTC)
 
 
-def run(job, moment, run_status, summary=None, details=None):
+def run(job, moment, run_status, summary=None, details=None, rules=None):
     """One status object exactly as status.build_status writes it."""
     payload = {
         "run_id": f"{job}-{stamp(moment)}",
@@ -125,6 +125,7 @@ def run(job, moment, run_status, summary=None, details=None):
         "timestamp_utc": stamp(moment),
         "summary": summary or f"The {job} run finished with {run_status}.",
         "details": list(details or []),
+        "rules": list(rules or []),
         "code_version": "46d2f13",
         "workflow_run_url": None,
     }
@@ -1680,3 +1681,54 @@ def test_the_only_write_is_the_state_object():
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
     }
     assert "state_key" in keys
+
+
+def test_two_different_data_fails_are_two_emails(sent):
+    """The drill case, 2026-09-02. A map cell emptied on one run and the
+    feature count collapsed on the next. Both are DATA_FAIL, so until the rule
+    names went into the value the second sent nothing and the reader was left
+    believing nothing had changed since the first.
+
+    DESIGN.md 8.5 still holds either side of this: the same failure repeating
+    is one email, which the test below asserts.
+    """
+    entries = [
+        run("checks", at(24, 2, 6), "DATA_FAIL", rules=["bin_disappeared"]),
+        run("checks", at(25, 2, 6), "DATA_FAIL", rules=["bin_count_change", "feature_count"]),
+    ]
+    entries += [run("backup", at(day, 4, 40), "PASS") for day in (22, 25)]
+
+    poll_hourly(entries, at(24, 3), at(26, 3))
+
+    assert count(sent, "daily integrity check") == 2
+
+
+def test_the_same_failure_repeating_is_still_one_email(sent):
+    """The property the change had to keep. An unresolved incident compares
+    against the same pre-incident baseline every day - previous_run skips
+    DATA_FAIL days - so the same rules fire and the value does not move."""
+    entries = [
+        run("checks", at(day, 2, 6), "DATA_FAIL", rules=["feature_count"])
+        for day in (24, 25, 26)
+    ]
+    entries += [run("backup", at(day, 4, 40), "PASS") for day in (22, 25)]
+
+    poll_hourly(entries, at(24, 3), at(27, 3))
+
+    assert count(sent, "daily integrity check") == 1
+
+
+def test_a_status_object_written_before_rules_existed_still_compares(sent):
+    """Every object already in the bucket predates the field. An absent
+    `rules` reads as nothing broken, so no migration is needed and a poll
+    across the boundary does not invent an email."""
+    old = run("checks", at(24, 2, 6), "DATA_FAIL", rules=["feature_count"])
+    del old[2]["rules"]
+    entries = [old, run("checks", at(25, 2, 6), "DATA_FAIL", rules=["feature_count"])]
+    entries += [run("backup", at(day, 4, 40), "PASS") for day in (22, 25)]
+
+    poll_hourly(entries, at(24, 3), at(26, 3))
+
+    # One for the first, one when the rules appear - the value genuinely
+    # changed, and erring towards a duplicate beats erring towards silence.
+    assert count(sent, "daily integrity check") == 2
