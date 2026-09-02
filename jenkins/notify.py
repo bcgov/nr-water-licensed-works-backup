@@ -1164,8 +1164,8 @@ def finding_blocks(findings):
         heading("Needs attention"),
         bullets(finding_bullet(line) for line in findings),
         paragraph(
-            "These features sit well outside the province, so the records are "
-            "wrong wherever they came from. Only the data owner can correct them."
+            "These features sit well outside the province and will need to be "
+            "corrected."
         ),
         paragraph(
             "**Nothing has happened today.** The records have been like this "

@@ -566,7 +566,7 @@ def test_a_finding_rides_in_the_run_s_own_email(sent):
     # The context that only makes sense in an email, and the sentence that
     # stops a reader assuming their backups have stopped being promoted.
     assert "does not stop backups being promoted" in flat(alert["body"])
-    assert "Only the data owner can correct them" in flat(alert["body"])
+    assert "will need to be corrected" in flat(alert["body"])
     # The status alone would have reached the developer. The finding widens it
     # to the people who would correct the records.
     assert sorted(alert["to"]) == sorted(
