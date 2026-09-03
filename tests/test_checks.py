@@ -1020,3 +1020,171 @@ def test_the_summary_leads_with_the_most_serious_violation():
     )
     assert summary.startswith("The schema changed.")
     assert "1 other issue(s)" in summary
+
+
+# ---------------------------------------------------------------------------
+# The retry, added 2026-09-03 after a measured failure (DESIGN.md 7.6.4)
+# ---------------------------------------------------------------------------
+
+
+def failing_call(failures, value="answered"):
+    """A call that fails the first `failures` times, then succeeds."""
+    attempts = {"n": 0}
+
+    def call():
+        attempts["n"] += 1
+        if attempts["n"] <= failures:
+            raise RuntimeError("Unable to perform query. Please check your parameters.")
+        return value
+
+    call.attempts = attempts
+    return call
+
+
+def test_a_query_that_fails_once_is_asked_again():
+    """Six of 1,020 grid queries failed on 2026-09-03 and all six recovered on
+    the first immediate retry. One failure used to discard the whole run."""
+    retries = []
+    call = failing_call(1)
+
+    assert checks.attempt_query("envelope count", call, retries) == "answered"
+    assert call.attempts["n"] == 2
+    assert retries == ["envelope count"]
+
+
+def test_a_query_that_fails_twice_still_raises():
+    """The property the retry must not take away. A service that fails twice
+    running is an outage, and the run has to refuse to record numbers rather
+    than paper over it - the guards exist so a plausible wrong number cannot
+    reach a metrics file."""
+    call = failing_call(2)
+
+    with pytest.raises(RuntimeError):
+        checks.attempt_query("envelope count", call, [])
+
+
+def test_a_query_that_works_records_no_retry():
+    """The count is what makes a degrading service visible before it is an
+    outage, so it has to stay at zero on an ordinary run."""
+    retries = []
+    call = failing_call(0)
+
+    assert checks.attempt_query("feature count", call, retries) == "answered"
+    assert call.attempts["n"] == 1
+    assert retries == []
+
+
+def test_the_retry_list_is_optional():
+    """count_in_envelope is called from three places and only one of them
+    threads a list. Retrying must not depend on somebody remembering to."""
+    call = failing_call(1)
+
+    assert checks.attempt_query("envelope count", call) == "answered"
+    assert call.attempts["n"] == 2
+
+
+# ---------------------------------------------------------------------------
+# collect_layer_metrics itself
+#
+# Everything else in this file tests the rules, which take a metrics dict and
+# return violations, and tests/test_checks.py's whole-run test replaces
+# collect_layer_metrics with a stand-in. So until 2026-09-03 nothing exercised
+# the body of the function that actually assembles a metrics dict - and an
+# edit that returned early from it passed all 230 tests while collecting
+# almost nothing. The run finished in three seconds and wrote a 1.3 KB
+# metrics file where a real one is 22 KB, which is how it was caught.
+# ---------------------------------------------------------------------------
+
+
+class StandInLayer:
+    """A feature layer that answers every query collect_layer_metrics makes.
+
+    Hand-written rather than mocked, in the same spirit as the fixtures above:
+    the numbers are visible in the test, so what comes out can be checked
+    against what went in.
+    """
+
+    url = "https://example.invalid/FeatureServer/0"
+
+    def __init__(self, feature_count=100):
+        self.feature_count = feature_count
+        self.properties = {
+            "objectIdField": "OBJECTID",
+            "fields": [
+                {"name": "OBJECTID", "type": "esriFieldTypeOID"},
+                {"name": "TWRK_TAG", "type": "esriFieldTypeString"},
+                {"name": "FEATURE_CODE", "type": "esriFieldTypeString",
+                 "domain": {"type": "codedValue", "name": "LWL_FCODES",
+                            "codedValues": [{"code": "AA01"}]}},
+            ],
+            "types": [],
+            "editingInfo": {"lastEditDate": 1755000000000},
+        }
+        self._con = self
+
+    def post(self, url, params):
+        """The two raw REST calls: grouped value counts, and ids outside."""
+        if params.get("returnIdsOnly") == "true":
+            return {"objectIds": []}
+        return {"features": [
+            {"attributes": {"FEATURE_CODE": "AA01", "value_count": self.feature_count}}
+        ]}
+
+    def query(self, where="1=1", **kwargs):
+        if kwargs.get("return_count_only"):
+            # Every envelope query lands one feature in one cell, and the
+            # disjoint half returns nothing, so the partition adds up.
+            if kwargs.get("geometry_filter", {}).get("spatialRel") == "esriSpatialRelDisjoint":
+                return 0
+            if "geometry_filter" in kwargs:
+                return self.feature_count if "1350" in str(kwargs) else 0
+            if "IS NULL" in where:
+                return 0
+            return self.feature_count
+        if kwargs.get("return_extent_only"):
+            return {"extent": {"xmin": 1.0, "ymin": 2.0, "xmax": 3.0, "ymax": 4.0}}
+        raise AssertionError(f"unexpected query: {where} {kwargs}")
+
+
+def test_collect_layer_metrics_collects_all_of_it(monkeypatch):
+    """The shape of a real metrics entry, field for field. An early return
+    anywhere in this function is silent: the run still passes, still writes a
+    file, and the file is missing most of what the rules read."""
+    layer_config = {"name": "TEST", "item_id": "abc", "layer_index": 0,
+                    "has_length_field": False, "distinct_value_field": "FEATURE_CODE",
+                    "null_check_fields": ["TWRK_TAG", "FEATURE_CODE"]}
+    grid = {"xmin": 1350000, "ymin": 950000, "xmax": 1400000, "ymax": 1000000,
+            "cell_size_metres": 50000, "wkid": 3005, "max_sum_overcount_percent": 2}
+    config = {"checks": {"spatial_grid": grid}}
+
+    monkeypatch.setattr(checks, "open_layer", lambda gis, cfg: StandInLayer(100))
+    metrics = checks.collect_layer_metrics(None, "points", layer_config, config)
+
+    assert set(metrics) >= {
+        "feature_count", "extent", "schema_fingerprint", "last_edit_utc",
+        "null_counts", "null_rates_percent", "distinct_value_field",
+        "value_counts", "domain_coded_values", "values_outside_domain",
+        "spatial_bins", "spatial_bins_populated", "features_inside_grid",
+        "features_outside_grid", "objectids_outside_grid", "query_retries",
+    }
+    assert metrics["feature_count"] == 100
+    assert metrics["spatial_bins_populated"] == 1
+    assert metrics["query_retries"] == 0
+
+
+def test_an_empty_layer_returns_early_and_says_so(monkeypatch):
+    """The one legitimate early return: every rate below it divides by zero.
+    It still records the retry count, so the field is never missing."""
+    layer_config = {"name": "TEST", "item_id": "abc", "layer_index": 0,
+                    "has_length_field": False, "distinct_value_field": "FEATURE_CODE",
+                    "null_check_fields": ["TWRK_TAG"]}
+    config = {"checks": {"spatial_grid": {
+        "xmin": 0, "ymin": 0, "xmax": 50000, "ymax": 50000,
+        "cell_size_metres": 50000, "wkid": 3005, "max_sum_overcount_percent": 2}}}
+
+    monkeypatch.setattr(checks, "open_layer", lambda gis, cfg: StandInLayer(0))
+    metrics = checks.collect_layer_metrics(None, "points", layer_config, config)
+
+    assert metrics["feature_count"] == 0
+    assert "spatial_bins" not in metrics
+    assert metrics["query_retries"] == 0

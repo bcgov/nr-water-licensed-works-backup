@@ -181,17 +181,60 @@ def open_layer(gis, layer_config):
     return item.layers[layer_config["layer_index"]]
 
 
-def query_feature_count(layer):
+def attempt_query(description, call, retries=None):
+    """Run one query against the service, and ask a second time if it fails.
+
+    Written 2026-09-03, after two check runs died mid-collection on
+    `HTTP 400, Unable to perform query`. Walking all 1,020 points cells with a
+    retry measured the fault: 6 failed, 6 recovered on the first retry, and
+    they were scattered across the grid on an afternoon when the service was
+    also running at 0.28 s per query against a normal 0.16 s. Transient, and
+    not a bad cell.
+
+    A run makes about 2,040 of these. At the measured 0.6% the odds of
+    finishing one cleanly were roughly 1 in 250,000, and any single failure
+    discards the whole run - SYSTEM_FAIL, no metrics file, and a gap in the
+    next day's comparison. Production has not been bitten yet, in 26 runs.
+
+    ONE RETRY, WITH NO DELAY, AND NO BACKOFF. Six of six recovered on the
+    first immediate attempt, so that is what is written here: the
+    implementation plan asks for complexity when a failure has been observed
+    and not before, and a backoff would be inventing a second problem nobody
+    has seen. If the second attempt fails as well, this raises exactly as the
+    call did before - a service that fails twice running is an outage, and the
+    run should refuse to record numbers rather than paper over it.
+
+    `retries` is a list the caller owns and this appends to, so that a run can
+    record how much retrying it took. A run needing six retries is telling you
+    the service is degrading well before the day it fails outright, and that
+    belongs in the metrics file next to everything else measured. Passed
+    explicitly rather than kept in a module-level counter, which would be
+    state hiding in the module.
+    """
+    try:
+        return call()
+    except Exception as exc:
+        logger.warning(
+            "%s failed (%s), asking once more", description, type(exc).__name__
+        )
+        if retries is not None:
+            retries.append(description)
+        return call()
+
+
+def query_feature_count(layer, retries=None):
     """How many features the layer holds, right now.
 
     Live rather than the cached property: infoInEstimates declares the cached
     count an estimate, and every threshold in config.yml is calibrated
     against real counts.
     """
-    return int(layer.query(where="1=1", return_count_only=True))
+    return int(attempt_query(
+        "feature count", lambda: layer.query(where="1=1", return_count_only=True), retries
+    ))
 
 
-def query_extent(layer):
+def query_extent(layer, retries=None):
     """The live bounding box, as a plain dict of four numbers.
 
     There is deliberately no centroid alongside this. DESIGN.md 7.2 lists a
@@ -206,11 +249,13 @@ def query_extent(layer):
     being bitten by. The fixed grid below is what actually covers localized
     change. Any stored extent yields the centre if it is ever wanted.
     """
-    extent = layer.query(where="1=1", return_extent_only=True).get("extent", {})
+    extent = attempt_query(
+        "extent", lambda: layer.query(where="1=1", return_extent_only=True), retries
+    ).get("extent", {})
     return {corner: float(extent[corner]) for corner in ("xmin", "ymin", "xmax", "ymax")}
 
 
-def query_total_length(layer, length_field):
+def query_total_length(layer, length_field, retries=None):
     """Sum of the shape length field, in planar metres.
 
     Metres because these services report geometryProperties.units as
@@ -218,14 +263,14 @@ def query_total_length(layer, length_field):
     carry no Shape__Length, which is what has_length_field in config.yml
     records.
     """
-    result = layer.query(
+    result = attempt_query("total length", lambda: layer.query(
         where="1=1",
         out_statistics=[{
             "statisticType": "sum",
             "onStatisticField": length_field,
             "outStatisticFieldName": "total_length",
         }],
-    )
+    ), retries)
     if not result.features:
         raise RuntimeError(
             f"The SUM query on {length_field} returned no rows, so total "
@@ -234,17 +279,21 @@ def query_total_length(layer, length_field):
     return float(result.features[0].attributes["total_length"])
 
 
-def query_null_count(layer, field_name):
+def query_null_count(layer, field_name, retries=None):
     """How many features have no value in this field.
 
     IS NULL only, which is what DESIGN.md 7.2 specifies. Worth knowing when
     reading the number: both layers also carry blank-string values in
     FEATURE_CODE, and those are not nulls and are not counted here.
     """
-    return int(layer.query(where=f"{field_name} IS NULL", return_count_only=True))
+    return int(attempt_query(
+        f"null count on {field_name}",
+        lambda: layer.query(where=f"{field_name} IS NULL", return_count_only=True),
+        retries,
+    ))
 
 
-def query_value_counts(layer, field_name, feature_count):
+def query_value_counts(layer, field_name, feature_count, retries=None):
     """How many features carry each distinct value of a field.
 
     Collected with groupByFieldsForStatistics rather than
@@ -261,7 +310,7 @@ def query_value_counts(layer, field_name, feature_count):
     would silently return a short answer; a short answer cannot sum to the
     total.
     """
-    response = layer._con.post(
+    response = attempt_query(f"value counts on {field_name}", lambda: layer._con.post(
         f"{layer.url}/query",
         {
             "f": "json",
@@ -274,7 +323,7 @@ def query_value_counts(layer, field_name, feature_count):
                 "outStatisticFieldName": "value_count",
             }]),
         },
-    )
+    ), retries)
 
     value_counts = {}
     for feature in response.get("features", []):
@@ -295,7 +344,8 @@ def query_value_counts(layer, field_name, feature_count):
     return value_counts
 
 
-def count_in_envelope(layer, bounds, wkid, spatial_rel="esriSpatialRelIntersects"):
+def count_in_envelope(layer, bounds, wkid, spatial_rel="esriSpatialRelIntersects",
+                      retries=None):
     """Count the features touching a rectangle.
 
     One definition, used by every envelope query here, because the filter
@@ -310,7 +360,7 @@ def count_in_envelope(layer, bounds, wkid, spatial_rel="esriSpatialRelIntersects
         "xmax": bounds["xmax"], "ymax": bounds["ymax"],
         "spatialReference": {"wkid": wkid},
     }
-    return int(layer.query(
+    return int(attempt_query(f"envelope count {spatial_rel}", lambda: layer.query(
         where="1=1",
         geometry_filter={
             "geometry": json.dumps(envelope),
@@ -319,10 +369,10 @@ def count_in_envelope(layer, bounds, wkid, spatial_rel="esriSpatialRelIntersects
             "inSR": wkid,
         },
         return_count_only=True,
-    ))
+    ), retries))
 
 
-def query_objectids_outside_envelope(layer, bounds, wkid):
+def query_objectids_outside_envelope(layer, bounds, wkid, retries=None):
     """The OBJECTIDs of the features that fall outside the envelope entirely.
 
     The count of them is already collected - it is the disjoint half of the
@@ -344,7 +394,7 @@ def query_objectids_outside_envelope(layer, bounds, wkid):
         "xmax": bounds["xmax"], "ymax": bounds["ymax"],
         "spatialReference": {"wkid": wkid},
     }
-    response = layer._con.post(
+    response = attempt_query("objectids outside the envelope", lambda: layer._con.post(
         f"{layer.url}/query",
         {
             "f": "json",
@@ -356,7 +406,7 @@ def query_objectids_outside_envelope(layer, bounds, wkid):
             "spatialRel": "esriSpatialRelDisjoint",
             "inSR": wkid,
         },
-    )
+    ), retries)
     if "objectIds" not in response:
         raise RuntimeError(
             f"The disjoint query on {layer.url} returned no objectIds field, "
@@ -396,7 +446,7 @@ def grid_cells(grid):
     return cells
 
 
-def query_spatial_bins(layer, grid, layer_key):
+def query_spatial_bins(layer, grid, layer_key, retries=None):
     """Count the features in every cell of the fixed grid.
 
     Geohash binning, which this check was originally designed around, does
@@ -416,7 +466,7 @@ def query_spatial_bins(layer, grid, layer_key):
 
     populated = {}
     for cell_id, bounds in cells:
-        count = count_in_envelope(layer, bounds, grid["wkid"])
+        count = count_in_envelope(layer, bounds, grid["wkid"], retries=retries)
         if count:
             populated[cell_id] = count
 
@@ -429,7 +479,8 @@ def query_spatial_bins(layer, grid, layer_key):
     return populated
 
 
-def assert_grid_partitions_layer(layer, layer_key, spatial_bins, feature_count, grid):
+def assert_grid_partitions_layer(layer, layer_key, spatial_bins, feature_count, grid,
+                                 retries=None):
     """The known-answer guard, run on every pass before anything is recorded.
 
     This is what makes the grid numbers trustworthy, and DESIGN.md 7.2.2
@@ -452,9 +503,9 @@ def assert_grid_partitions_layer(layer, layer_key, spatial_bins, feature_count, 
     both recorded as metrics in their own right.
     """
     tolerance_percent = grid["max_sum_overcount_percent"]
-    inside = count_in_envelope(layer, grid, grid["wkid"])
+    inside = count_in_envelope(layer, grid, grid["wkid"], retries=retries)
     outside = count_in_envelope(
-        layer, grid, grid["wkid"], spatial_rel="esriSpatialRelDisjoint"
+        layer, grid, grid["wkid"], spatial_rel="esriSpatialRelDisjoint", retries=retries
     )
 
     partition_drift = abs((inside + outside) - feature_count)
@@ -547,7 +598,11 @@ def collect_layer_metrics(gis, layer_key, layer_config, config):
     grid = config["checks"]["spatial_grid"]
     logger.info("%s: collecting metrics", layer_key)
 
-    feature_count = query_feature_count(layer)
+    # Every query below appends to this when it had to ask the service a
+    # second time, so a run records how much retrying it took (7.6.4).
+    retries = []
+
+    feature_count = query_feature_count(layer, retries)
     metrics = {
         "item_id": layer_config["item_id"],
         "layer_id": layer_config["layer_index"],
@@ -561,9 +616,10 @@ def collect_layer_metrics(gis, layer_key, layer_config, config):
     if feature_count == 0:
         logger.error("%s: the layer reports zero features", layer_key)
         metrics["schema_fingerprint"] = schema_fingerprint(layer.properties)
+        metrics["query_retries"] = len(retries)
         return metrics
 
-    metrics["extent"] = query_extent(layer)
+    metrics["extent"] = query_extent(layer, retries)
     metrics["schema_fingerprint"] = schema_fingerprint(layer.properties)
 
     # A layer-wide "something changed" signal with no attribution or volume,
@@ -575,10 +631,10 @@ def collect_layer_metrics(gis, layer_key, layer_config, config):
     ) if last_edit else None
 
     if layer_config["has_length_field"]:
-        metrics["total_length"] = query_total_length(layer, "Shape__Length")
+        metrics["total_length"] = query_total_length(layer, "Shape__Length", retries)
 
     metrics["null_counts"] = {
-        field_name: query_null_count(layer, field_name)
+        field_name: query_null_count(layer, field_name, retries)
         for field_name in layer_config["null_check_fields"]
     }
     metrics["null_rates_percent"] = {
@@ -608,7 +664,7 @@ def collect_layer_metrics(gis, layer_key, layer_config, config):
     # without re-collecting anything.
     distinct_field = layer_config["distinct_value_field"]
     metrics["distinct_value_field"] = distinct_field
-    metrics["value_counts"] = query_value_counts(layer, distinct_field, feature_count)
+    metrics["value_counts"] = query_value_counts(layer, distinct_field, feature_count, retries)
 
     domain_codes = (
         metrics["schema_fingerprint"]["domains"].get(distinct_field, {}).get("coded_values", [])
@@ -619,9 +675,9 @@ def collect_layer_metrics(gis, layer_key, layer_config, config):
         if value not in domain_codes and value != NULL_VALUE_LABEL
     )
 
-    metrics["spatial_bins"] = query_spatial_bins(layer, grid, layer_key)
+    metrics["spatial_bins"] = query_spatial_bins(layer, grid, layer_key, retries)
     inside, outside = assert_grid_partitions_layer(
-        layer, layer_key, metrics["spatial_bins"], feature_count, grid
+        layer, layer_key, metrics["spatial_bins"], feature_count, grid, retries
     )
     metrics["spatial_bins_populated"] = len(metrics["spatial_bins"])
     metrics["features_inside_grid"] = inside
@@ -634,13 +690,22 @@ def collect_layer_metrics(gis, layer_key, layer_config, config):
     if outside:
         metrics["objectids_outside_grid"] = checked_outlier_objectids(
             layer_key,
-            query_objectids_outside_envelope(layer, grid, grid["wkid"]),
+            query_objectids_outside_envelope(layer, grid, grid["wkid"], retries),
             outside,
         )
         logger.warning(
             "%s: %s feature(s) fall outside the grid envelope entirely - "
             "OBJECTID %s", layer_key, f"{outside:,}",
             ", ".join(str(object_id) for object_id in metrics["objectids_outside_grid"]),
+        )
+
+    metrics["query_retries"] = len(retries)
+    if retries:
+        # Worth a line in the log as well as a number in the metrics file: a
+        # run that needed retries finished, and is still evidence the service
+        # is degrading before the day it fails outright (DESIGN.md 7.6.4).
+        logger.warning(
+            "%s: %d quer(ies) had to be asked twice", layer_key, len(retries)
         )
 
     logger.info(
