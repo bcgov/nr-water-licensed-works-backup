@@ -319,13 +319,40 @@ checks:
 thresholds:
 
   lines:
+    # NOT A PLACEHOLDER since 2026-09-07. Set from measurement on both
+    # sides, which is what the detection drill existed to provide.
+    #
+    # Normal: 14 days of production metrics to 2026-08-31. Both layers only
+    # ever GREW - total drift +43 lines and +7 points - and the largest
+    # single-day movement in either direction was +11 features (0.008%).
+    #
+    # Abnormal: the drill deleted 3,455 points (6.40%) and the old rule said
+    # WARN, which routes to the developer alone, blocks nothing, and would
+    # have let a backup of the damaged layer become the month's archive copy.
+    #
+    # And the shape was wrong, not just the number. The data owner's reading,
+    # 2026-09-07: this layer never normally loses features - the only cases
+    # are a user removing erroneous records or merging lines, and that is
+    # rare. So a loss is abnormal by nature rather than past some proportion,
+    # which makes an absolute floor the real guard and the percentage a
+    # backstop for a layer that has grown a lot since this was written.
+    #
+    # 100 is about nine times the largest daily change ever observed. A rare
+    # legitimate deletion above it raises DATA_FAIL, which pauses pruning and
+    # blocks that month's promotion until somebody looks - that is what the
+    # suppressions block is for. A threshold tuned never to inconvenience a
+    # rare planned edit is one that misses the unplanned one.
     feature_count:
       decrease:
-        fail_when: both      # PLACEHOLDER
-        percent: 10          # PLACEHOLDER
-        absolute: 100        # PLACEHOLDER
+        fail_when: any
+        percent: 1
+        absolute: 100
         severity: FAIL
       increase:
+        # WARN, deliberately. A bulk load from a geodatabase is legitimate
+        # and happens at intervals, so this reports and blocks nothing:
+        # promotion accepts WARN, pruning continues, and it reaches the
+        # developer rather than the client. Confirmed 2026-09-07.
         fail_when: any       # PLACEHOLDER
         percent: 25          # PLACEHOLDER
         severity: WARN
@@ -364,13 +391,40 @@ thresholds:
     # No distinct_values rule - see the note above the thresholds block.
 
   points:
+    # NOT A PLACEHOLDER since 2026-09-07. Set from measurement on both
+    # sides, which is what the detection drill existed to provide.
+    #
+    # Normal: 14 days of production metrics to 2026-08-31. Both layers only
+    # ever GREW - total drift +43 lines and +7 points - and the largest
+    # single-day movement in either direction was +11 features (0.008%).
+    #
+    # Abnormal: the drill deleted 3,455 points (6.40%) and the old rule said
+    # WARN, which routes to the developer alone, blocks nothing, and would
+    # have let a backup of the damaged layer become the month's archive copy.
+    #
+    # And the shape was wrong, not just the number. The data owner's reading,
+    # 2026-09-07: this layer never normally loses features - the only cases
+    # are a user removing erroneous records or merging lines, and that is
+    # rare. So a loss is abnormal by nature rather than past some proportion,
+    # which makes an absolute floor the real guard and the percentage a
+    # backstop for a layer that has grown a lot since this was written.
+    #
+    # 100 is about nine times the largest daily change ever observed. A rare
+    # legitimate deletion above it raises DATA_FAIL, which pauses pruning and
+    # blocks that month's promotion until somebody looks - that is what the
+    # suppressions block is for. A threshold tuned never to inconvenience a
+    # rare planned edit is one that misses the unplanned one.
     feature_count:
       decrease:
-        fail_when: both      # PLACEHOLDER
-        percent: 10          # PLACEHOLDER
-        absolute: 250        # PLACEHOLDER - larger layer, ~54k features
+        fail_when: any
+        percent: 1
+        absolute: 100
         severity: FAIL
       increase:
+        # WARN, deliberately. A bulk load from a geodatabase is legitimate
+        # and happens at intervals, so this reports and blocks nothing:
+        # promotion accepts WARN, pruning continues, and it reaches the
+        # developer rather than the client. Confirmed 2026-09-07.
         fail_when: any       # PLACEHOLDER
         percent: 25          # PLACEHOLDER
         severity: WARN
