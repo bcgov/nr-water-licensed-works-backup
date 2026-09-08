@@ -44,6 +44,12 @@ This verifies the artifact's checksum against the manifest, reads the layer, and
 
 If the checksum does not match, stop and download the artifact again. There is no way to override it, on purpose: an artifact that cannot be verified is not something to empty a layer for.
 
+**If the problem included a deleted or renamed field, re-add it first.**
+
+A restore puts the data back, not the schema. `append` writes into whatever fields the layer currently has, so a field that was deleted stays deleted and its column comes back empty — the run reports success either way. Measured on a test copy: 53,993 features restored, one dropped field still missing.
+
+The values themselves are safe in the artifact. Add the field back with its original definition — `servicedef.json` in the same backup set records the exact name, type and length — and then restore, and the column repopulates.
+
 ### 2. Do it
 
 Add `--execute`:
