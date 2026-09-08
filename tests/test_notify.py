@@ -938,7 +938,12 @@ def test_the_routing_table_drives_recipients_for_all_five_statuses(sent):
     expected = {
         "PASS": [],
         "BASELINE": [ADDRESSES["developer"]],
-        "WARN": [ADDRESSES["developer"]],
+        # WARN joined DATA_FAIL on 2026-09-07. The five WARN rules are all
+        # statements about the data owner's data, and she was already
+        # receiving most of them as a side effect of a validity finding
+        # widening whatever run carried it - which would have stopped
+        # silently the day those records were corrected.
+        "WARN": sorted(ADDRESSES.values()),
         "DATA_FAIL": sorted(ADDRESSES.values()),
         "SYSTEM_FAIL": [ADDRESSES["developer"]],
     }

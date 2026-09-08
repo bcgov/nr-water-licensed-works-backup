@@ -503,7 +503,24 @@ notifications:
   routing:
     PASS: []
     BASELINE: [developer]
-    WARN: [developer]
+    # Changed 2026-09-07, from the developer, and it settles something that
+    # was never actually decided. WARN routed to the developer alone on the
+    # grounds that client-side noise erodes attention (DESIGN.md 8.4) - but
+    # the five WARN rules are all statements about her data: a bulk load, a
+    # map cell thinning, the extent moving, total length changing, fields
+    # going blank.
+    #
+    # And she was already receiving most of them by accident. A validity
+    # finding widens the recipients of whatever run carries it, and points
+    # carries one on every run while OBJECTIDs 150984/150985 stand
+    # uncorrected - so a WARN on points reached all three roles, and would
+    # have silently stopped doing so the day those records were fixed. The
+    # old value was not a decision, it was a side effect.
+    #
+    # The shared inbox is included because it gets everything the data owner
+    # gets. Two addresses for one audience, so that a message cannot reach
+    # her and not the team, or the reverse.
+    WARN: [data_owner, shared_inbox, developer]
     DATA_FAIL: [data_owner, shared_inbox, developer]
     SYSTEM_FAIL: [developer]
     stale: [developer]
