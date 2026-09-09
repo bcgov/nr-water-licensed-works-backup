@@ -767,11 +767,11 @@ def test_the_dedup_value_is_the_bare_status_when_there_is_no_finding():
     first poll after the deploy see a change and mail about it."""
     assert notify.status_value("PASS", []) == "PASS"
     assert notify.status_value("DATA_FAIL", ()) == "DATA_FAIL"
-    assert notify.status_value("PASS", [OUTSIDE_BC]) == "PASS + points 2"
+    assert notify.status_value("PASS", [OUTSIDE_BC]) == "PASS + points 2 outside_bc"
 
     # And it splits back apart wherever a recorded value is compared against
     # the five statuses.
-    assert notify.status_part("PASS + points 2") == "PASS"
+    assert notify.status_part("PASS + points 2 outside_bc") == "PASS"
     assert notify.status_part("DATA_FAIL") == "DATA_FAIL"
 
 
@@ -962,13 +962,13 @@ def test_the_routing_table_drives_recipients_for_all_five_statuses(sent):
 
 
 def test_every_routed_outcome_has_a_row_in_config():
-    """The five statuses plus the five this job raises itself. A missing row
+    """The five statuses plus the six this job raises itself. A missing row
     would present as an alert that was never sent."""
     routing = CONFIG["notifications"]["routing"]
     assert set(routing) == {
         "PASS", "BASELINE", "WARN", "DATA_FAIL", "SYSTEM_FAIL",
         "stale", "prune_paused", "no_monthly_candidate", "features_outside_bc",
-        "weekly_summary",
+        "null_geometry", "weekly_summary",
     }
     for outcome in routing:
         assert notify.routing_for(CONFIG, outcome) == list(routing[outcome])
@@ -1472,8 +1472,8 @@ def test_the_outside_bc_marker_matches_what_checks_py_writes():
         payload={"status": "BASELINE", "details": ["compared against nothing", finding]},
     )
 
-    assert notify.outside_bc_lines(record) == [finding]
-    assert notify.outside_bc_signature([finding]) == "points 2"
+    assert notify.finding_lines(record) == [finding]
+    assert notify.findings_signature([finding]) == "points 2 outside_bc"
 
 
 def test_the_signature_reads_the_count_a_third_record_changes():
@@ -1486,8 +1486,8 @@ def test_the_signature_reads_the_count_a_third_record_changes():
         })
         for count_outside in (2, 3)
     )
-    assert notify.outside_bc_signature([two]) == "points 2"
-    assert notify.outside_bc_signature([three]) == "points 3"
+    assert notify.findings_signature([two]) == "points 2 outside_bc"
+    assert notify.findings_signature([three]) == "points 3 outside_bc"
 
 
 def test_the_signature_reads_a_count_written_with_thousands_separators():
@@ -1497,7 +1497,7 @@ def test_the_signature_reads_a_count_written_with_thousands_separators():
     finding = checks.outside_bc_finding(
         "points", {"features_outside_grid": 53987, "objectids_outside_grid": [1, 2]},
     )
-    assert notify.outside_bc_signature([finding]) == "points 53987"
+    assert notify.findings_signature([finding]) == "points 53987 outside_bc"
 
 
 def test_a_line_the_signature_cannot_parse_still_produces_one_email():
@@ -1505,7 +1505,7 @@ def test_a_line_the_signature_cannot_parse_still_produces_one_email():
     rather than one an hour. The line itself is stable while the situation
     is, so it stands in as the value."""
     reworded = "something is outside British Columbia, somehow"
-    assert notify.outside_bc_signature([reworded]) == reworded
+    assert notify.findings_signature([reworded]) == reworded
 
 
 def test_the_outside_bc_finding_is_not_read_from_a_backup_run():
@@ -1515,7 +1515,7 @@ def test_the_outside_bc_finding_is_not_read_from_a_backup_run():
         job="backup", moment=at(19, 4, 40), key="status/x.json",
         payload={"status": "PASS", "details": ["published rotating/2026-08-19"]},
     )
-    assert notify.outside_bc_lines(record) == []
+    assert notify.finding_lines(record) == []
 
 
 def test_the_prune_paused_marker_matches_what_backup_py_writes():
@@ -1737,3 +1737,112 @@ def test_a_status_object_written_before_rules_existed_still_compares(sent):
     # One for the first, one when the rules appear - the value genuinely
     # changed, and erring towards a duplicate beats erring towards silence.
     assert count(sent, "daily integrity check") == 2
+
+
+# ---------------------------------------------------------------------------
+# The second validity finding: features with no geometry (DESIGN.md 7.6.2)
+#
+# Same mechanism as the out-of-BC finding and the same reason for it - a
+# record that cannot be right, kept out of the run status so that it cannot
+# block monthly promotion, and put in front of somebody by a routing row of
+# its own. What is asserted here is that the second condition is genuinely
+# routed and deduplicated separately from the first, rather than riding on it.
+# ---------------------------------------------------------------------------
+
+NULL_GEOMETRY = "lines: 1 feature has no geometry (OBJECTID 420170)."
+
+
+def test_the_null_geometry_marker_matches_what_checks_py_writes():
+    """Built from the real function rather than from a copy of its wording. A
+    rewording in checks.py with none here would silence it, which is the
+    failure this finding exists to have fixed."""
+    finding = checks.null_geometry_finding(
+        "lines",
+        {"features_with_null_geometry": 1, "objectids_with_null_geometry": [420170]},
+    )
+    record = notify.StatusRecord(
+        job="checks", moment=at(19, 2, 6), key="status/x.json",
+        payload={"status": "PASS", "details": ["compared against 2026-08-18", finding]},
+    )
+
+    assert notify.finding_lines(record) == [finding]
+    assert notify.findings_signature([finding]) == "lines 1 null_geometry"
+
+
+def test_the_two_findings_are_told_apart_in_the_dedup_value():
+    """The blind spot the rule names were added to close, in a second place.
+    Without the condition in the value, one record outside BC and one with no
+    geometry on the same layer read identically."""
+    outside = checks.outside_bc_finding(
+        "lines", {"features_outside_grid": 1, "objectids_outside_grid": [420170]})
+
+    assert notify.findings_signature([outside]) != notify.findings_signature(
+        [NULL_GEOMETRY])
+
+
+def test_a_null_geometry_appearing_on_a_passing_day_still_sends(sent):
+    """The case the whole finding mechanism exists for. A healthy run is a
+    PASS, PASS routes to nobody, so without the finding in the dedup value a
+    new bad record would reach no one."""
+    entries = [
+        run("checks", at(18, 2, 6), "PASS"),
+        run("checks", at(19, 2, 6), "PASS", details=[NULL_GEOMETRY]),
+    ]
+
+    poll_hourly(entries, at(18, 3), at(20, 3))
+
+    assert count(sent, "no geometry") == 1
+
+
+def test_the_same_null_geometry_repeating_is_one_email(sent):
+    """Three records nobody has corrected are one situation, not a daily one.
+    DESIGN.md 8.5."""
+    entries = [
+        run("checks", at(day, 2, 6), "PASS", details=[NULL_GEOMETRY])
+        for day in (18, 19, 20)
+    ]
+
+    poll_hourly(entries, at(18, 3), at(21, 3))
+
+    assert count(sent, "no geometry") == 1
+
+
+def test_a_second_null_geometry_record_is_a_second_email(sent):
+    """Two of the three found on 2026-09-01 were created that week, so this
+    condition grows. A count that moves has to be news."""
+    two = "lines: 2 features have no geometry (OBJECTID 420170, 422788)."
+    entries = [
+        run("checks", at(18, 2, 6), "PASS", details=[NULL_GEOMETRY]),
+        run("checks", at(19, 2, 6), "PASS", details=[two]),
+    ]
+
+    poll_hourly(entries, at(18, 3), at(20, 3))
+
+    assert count(sent, "no geometry") == 2
+
+
+def test_the_null_geometry_finding_reaches_the_data_owner(sent):
+    """Its own routing row, set as a data failure is, because that is what it
+    is: the records belong to Water Authorizations and only the data owner
+    can get them corrected."""
+    entries = [run("checks", at(18, 2, 6), "PASS", details=[NULL_GEOMETRY])]
+
+    poll_hourly(entries, at(18, 3), at(19, 3))
+
+    alert = only(sent, "no geometry")
+    assert sorted(alert["to"]) == sorted(ADDRESSES.values())
+
+
+def test_both_findings_in_one_run_are_one_email_naming_both(sent):
+    """One email per run, not one per kind of problem."""
+    entries = [
+        run("checks", at(18, 2, 6), "PASS", details=[OUTSIDE_BC, NULL_GEOMETRY]),
+    ]
+
+    poll_hourly(entries, at(18, 3), at(19, 3))
+
+    alert = only(sent, "integrity check")
+    assert "outside British Columbia" in alert["subject"]
+    assert "no geometry" in alert["subject"]
+    assert "150984" in alert["body"]
+    assert "420170" in alert["body"]

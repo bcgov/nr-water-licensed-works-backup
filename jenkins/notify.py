@@ -13,10 +13,11 @@ does all the substantive work and writes a status object every run; this job
 reads `status`, looks the recipients up in config.yml, and builds the message
 around `summary`. All judgement stays in checks.py - with two deliberate exceptions,
 both marked where they happen. no_monthly_candidate is reported in the details
-of a run whose status is PASS, and PASS routes to nobody. features_outside_bc
-is kept out of the status on purpose, because a status that can never be PASS
-would permanently block promotion to the monthly tier (DESIGN.md 7.6.1), so
-its routing row widens who the run's own email goes to instead.
+of a run whose status is PASS, and PASS routes to nobody. The validity findings
+- features_outside_bc, and null_geometry since 2026-09-08 - are kept out of the
+status on purpose, because a status that can never be PASS would permanently
+block promotion to the monthly tier (DESIGN.md 7.6.1), so their routing rows
+widen who the run's own email goes to instead.
 
 ONE EMAIL PER RUN, NOT ONE PER KIND OF PROBLEM. Everything a check run found
 travels in that run's own message: the status, the summary, the validity
@@ -149,7 +150,28 @@ RESOLVING_STATUSES = ("WARN", "DATA_FAIL", "SYSTEM_FAIL")
 # month's time.
 MONTHLY_CANDIDATE_MARKER = "days in with nothing promoted to the monthly tier"
 PRUNE_PAUSED_MARKER = "pruning paused"
-OUTSIDE_BC_MARKER = "outside British Columbia"
+
+# Every validity finding checks.py can write, as three things: the phrase
+# that identifies its line in the details, the config.yml routing row naming
+# who it adds to the run's recipients, and a short tag for the dedup value.
+#
+# One entry per condition rather than one shared "there is a finding" flag,
+# because DESIGN.md 8.4 routes per condition and narrowing one row must not
+# narrow the other. The tag is in the dedup value for the reason the rule
+# names are (8.5): without it, one feature outside BC and one with no
+# geometry on the same layer produce the same value, and an incident that
+# changes character while it is open goes unreported.
+#
+# The phrases are a contract with checks.py. tests/test_notify.py builds the
+# real lines from checks.outside_bc_finding and checks.null_geometry_finding
+# and asserts these still match, so a rewording fails a test rather than
+# failing silently in a month's time.
+VALIDITY_FINDINGS = (
+    ("outside British Columbia", "features_outside_bc", "outside_bc",
+     "features recorded outside British Columbia"),
+    ("no geometry", "null_geometry", "null_geometry",
+     "features recorded with no geometry"),
+)
 
 # How far back the episode walks read. An episode longer than this is
 # truncated, which is harmless: the walks are only ever asked whether an
@@ -412,27 +434,41 @@ def reports(record, marker):
     return any(marker in str(line) for line in record.payload.get("details", []))
 
 
-def outside_bc_lines(record):
-    """The lines checks.py wrote about features outside the province.
+def finding_lines(record):
+    """The lines checks.py wrote about records that cannot be right.
 
-    All of them, because there is one per layer and both layers can have
-    them. They are the message as well as the signal, so unlike the other two
-    markers this one wants the text rather than a yes or no.
+    All of them, because there is one per layer per condition and both layers
+    can carry both. They are the message as well as the signal, so unlike the
+    other two markers these want the text rather than a yes or no.
     """
     return [
         str(line) for line in record.payload.get("details", [])
-        if OUTSIDE_BC_MARKER in str(line)
+        if any(marker in str(line) for marker, _, _, _ in VALIDITY_FINDINGS)
     ]
 
 
-def outside_bc_signature(lines):
-    """What the out-of-province situation currently is, as one short string.
+def finding_tag(line):
+    """Which condition one finding line reports, or None if it parses as
+    neither. Used for the dedup value and for the routing."""
+    for marker, _, tag, _ in VALIDITY_FINDINGS:
+        if marker in line:
+            return tag
+    return None
+
+
+def findings_signature(lines):
+    """What the validity findings currently are, as one short string.
 
     checks.py writes each line as '<layer>: <count> features are outside
-    British Columbia (OBJECTID ...)', so the layer and the count are the front
-    of it and everything that follows is detail. Reading only those
-    two is what makes a run that names the same records produce no second
-    email, while a third bad record appearing produces one.
+    British Columbia (OBJECTID ...)' or '<layer>: <count> features have no
+    geometry (OBJECTID ...)', so the layer and the count are the front of it
+    and everything that follows is detail. Reading the layer, the count and
+    which condition it is, is what makes a run that names the same records
+    produce no second email while a third bad record appearing produces one.
+
+    The condition is in the value because without it a layer with one record
+    of each kind reads identically to a layer with the two counts swapped -
+    the same blind spot the rule names were added to close (DESIGN.md 8.5).
 
     A line this cannot parse is used whole rather than discarded, for the
     same reason unpromoted_month falls back: a reworded message should still
@@ -446,8 +482,9 @@ def outside_bc_signature(lines):
         # The count is written with thousands separators, as every count in
         # this project is.
         count = rest.strip().split(" ", 1)[0].replace(",", "")
-        if separator and layer and count.isdigit():
-            found.append(f"{layer} {int(count)}")
+        tag = finding_tag(line)
+        if separator and layer and count.isdigit() and tag:
+            found.append(f"{layer} {int(count)} {tag}")
         else:
             found.append(line)
     return ", ".join(sorted(found))
@@ -636,7 +673,8 @@ def routing_for(config, outcome):
             f"Add one - an empty list means nobody is mailed, which is a "
             f"decision worth writing down rather than arriving at by accident. "
             f"The rows are the five run statuses plus stale, prune_paused, "
-            f"no_monthly_candidate, features_outside_bc and weekly_summary."
+            f"no_monthly_candidate, features_outside_bc, null_geometry and "
+            f"weekly_summary."
         )
     return list(routing[outcome])
 
@@ -1131,7 +1169,7 @@ def status_value(run_status, findings, rules=()):
     if rules:
         parts.append(f"[{','.join(rules)}]")
     if findings:
-        parts.append(f"+ {outside_bc_signature(findings)}")
+        parts.append(f"+ {findings_signature(findings)}")
     return " ".join(parts)
 
 
@@ -1167,17 +1205,29 @@ def finding_roles(config, findings):
     A finding says a record cannot be right, and only the data owner can
     correct it, so it widens the list beyond whoever the run status alone
     would reach. Which matters most on the status that reaches nobody: PASS.
+
+    Per condition, because config.yml routes them per condition and one may
+    be narrowed to the developer without the other. A line that parses as
+    neither is routed as the first, rather than as nobody: a reworded message
+    should still reach somebody.
     """
-    return routing_for(config, "features_outside_bc") if findings else []
+    roles = []
+    for line in findings:
+        tag = finding_tag(line)
+        matched = next(
+            (row for row in VALIDITY_FINDINGS if row[2] == tag), VALIDITY_FINDINGS[0]
+        )
+        roles = merge_roles(roles, routing_for(config, matched[1]))
+    return roles
 
 
 def finding_bullet(line):
     """One finding line as a bullet, with its layer name in front.
 
-    checks.outside_bc_finding writes '<layer>: <count> features are outside
-    ...'. A line that does not have that shape is used exactly as written, for
-    the same reason outside_bc_signature falls back to the whole line: a
-    rewording should still tell somebody rather than tell nobody.
+    checks.py writes '<layer>: <count> features are outside ...'. A line that
+    does not have that shape is used exactly as written, for the same reason
+    findings_signature falls back to the whole line: a rewording should still
+    tell somebody rather than tell nobody.
     """
     layer, separator, rest = line.partition(":")
     if not separator or not rest.strip():
@@ -1197,23 +1247,40 @@ def finding_blocks(findings):
     return [
         heading("Needs attention"),
         bullets(finding_bullet(line) for line in findings),
+        # Worded to cover both findings, which is why it no longer names the
+        # province. "These features sit well outside the province" was right
+        # while out-of-BC was the only one; a feature with no geometry is not
+        # anywhere at all. DESIGN.md 8.3.1.
         paragraph(
-            "These features sit well outside the province and will need to be "
+            "These records cannot be right as they stand and will need to be "
             "corrected."
         ),
+        # "Nothing has happened today" was true of a backlog nobody had
+        # corrected and false of the two null-geometry records created in one
+        # day. What is true of both is that a finding is not the result of the
+        # comparison the rest of the message reports.
         paragraph(
-            "**Nothing has happened today.** The records have been like this "
-            "all along, and this section will appear on every email until they "
-            "are corrected or removed. It does not affect the result above, and "
-            "it does not stop backups being promoted to the monthly tier."
+            "**This is not part of the change comparison above.** A finding "
+            "says a record cannot be right, whichever run first reported it, "
+            "and this section will appear on every email until the records "
+            "are corrected or removed. It does not affect the result above, "
+            "and it does not stop backups being promoted to the monthly tier."
         ),
     ]
 
 
-# What the subject says when a run reports a validity finding. There is one
-# kind of finding today and naming it beats a category word: "data quality
-# findings" told the reader nothing they could act on.
-FINDING_HEADLINE = "features recorded outside British Columbia"
+def finding_headline(findings):
+    """What the subject says about the findings a run reported.
+
+    Naming the condition beats a category word: 'data quality findings' told
+    the reader nothing they could act on. Two conditions are joined rather
+    than collapsed back into one, for the same reason.
+    """
+    named = []
+    for _, _, tag, headline in VALIDITY_FINDINGS:
+        if any(finding_tag(line) == tag for line in findings) and headline not in named:
+            named.append(headline)
+    return " and ".join(named) or "records that cannot be right"
 
 # The statuses that are themselves news. On these the status leads the subject
 # and the finding follows it. On PASS and BASELINE there is no competing
@@ -1239,9 +1306,10 @@ def status_subject(record, run_status, findings):
     label = JOB_LABELS[record.job]
     if not findings:
         return f"{SUBJECT_PREFIX} {run_status}: {label}"
+    headline = finding_headline(findings)
     if run_status in HEADLINE_STATUSES:
-        return f"{SUBJECT_PREFIX} {run_status}: {label}, and {FINDING_HEADLINE}"
-    return f"{SUBJECT_PREFIX} {label.capitalize()}: {FINDING_HEADLINE}"
+        return f"{SUBJECT_PREFIX} {run_status}: {label}, and {headline}"
+    return f"{SUBJECT_PREFIX} {label.capitalize()}: {headline}"
 
 
 # ---------------------------------------------------------------------------
@@ -1577,7 +1645,7 @@ def collect_notifications(config, records, history, state, now):
         # recipient gets one report of what the check found and not two
         # (DESIGN.md 7.6.1.1). Always empty for the backup job, which measures
         # nothing about the data.
-        findings = outside_bc_lines(newest)
+        findings = finding_lines(newest)
         previous = state.get(f"status:{job}")
         if (
             previous
