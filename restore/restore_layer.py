@@ -16,14 +16,38 @@ WHAT IT DOES, IN THIS ORDER, AND THE ORDER IS THE POINT:
 
     1. verify the artifact's SHA-256 against the manifest beside it
     2. read the target layer and report what is about to be destroyed
-    3. ask for confirmation
-    4. delete_features(where="1=1")
-    5. append the artifact, preserving GlobalIDs
-    6. verify the count, extent and schema against the manifest
+    3. compare the layer's schema against the artifact's, and refuse if the
+       layer is missing fields the artifact has
+    4. ask for confirmation
+    5. upload the artifact to ArcGIS Online as a temporary item
+    6. delete_features(where="1=1")
+    7. append from the uploaded item, preserving GlobalIDs
+    8. verify the count, extent and schema against the manifest
 
-Nothing is deleted until the replacement is in hand and proven intact. The
-failure this refuses to allow is a half-verified artifact discovered to be
-wrong after the layer is already empty.
+Nothing is deleted until the replacement is in hand, proven intact, proven to
+fit, and accepted by the server. The failure this refuses to allow is a
+problem discovered after the layer is already empty.
+
+Steps 3 and 5 were moved in front of the delete on 2026-09-08, and both are
+about ordering rather than about new checks (DESIGN.md 11.1).
+
+A RESTORE RETURNS THE DATA, NOT THE SCHEMA - measured 2026-09-03. `append`
+writes into the layer's existing schema, and delete-and-append was chosen
+precisely because it preserves the item: its ID, service URL, sharing,
+symbology, subtypes and templates, which is what QuickWins and the staging
+script depend on. An operation cannot both leave the item exactly as it is
+and rewrite its structure. So a field dropped from the layer stays dropped
+and its column comes back empty, and the run reports success. The values are
+not lost - re-add the field, then restore, and the artifact repopulates it -
+which makes a restore after a schema change a TWO-STEP operation, and step 3
+is what stops somebody doing only the second half.
+
+THE UPLOAD HAPPENS BEFORE THE DELETE, and it costs nothing but ordering
+because the upload happens either way. It extends the principle already
+behind the checksum verification from "the file is intact" to "the server has
+accepted it and this API path still works" - which matters because this tool
+is written to be run at an unknown future date, quite possibly from an ArcGIS
+Pro conda environment that upgrades on its own schedule.
 
 WHY IT READS NOTHING FROM config.yml. Every other module in this repository
 is told what to touch by that file. This one is told by its arguments, every
@@ -64,7 +88,7 @@ import sys
 import time
 from pathlib import Path
 
-from arcgis.gis import GIS
+from arcgis.gis import GIS, ItemProperties, ItemTypeEnum
 
 logger = logging.getLogger("restore")
 
@@ -87,6 +111,11 @@ DEFAULT_PORTAL = "https://governmentofbc.maps.arcgis.com"
 # what backup.py stores. The append operation is told this format explicitly;
 # it has no way to work it out.
 UPLOAD_FORMAT = "filegdb"
+
+# The item type of the thing being uploaded, for Folder.add. Separate from
+# UPLOAD_FORMAT above, which is what append() is told to read - the two name
+# the same file to two different APIs and neither accepts the other's word.
+UPLOAD_ITEM_TYPE = ItemTypeEnum.FILE_GEODATABASE
 
 # The temporary uploaded item is deleted in a finally block, but a run killed
 # between the upload and the delete leaves one behind. The prefix is what
@@ -279,6 +308,78 @@ def compare_schema(current, expected):
     return differences
 
 
+def fields_the_layer_is_missing(current, expected):
+    """Fields the artifact carries that the target layer no longer has.
+
+    The one schema difference that silently loses data. `append` writes into
+    the layer's existing schema, so a dropped field stays dropped, its column
+    comes back empty, and the run reports success - measured on 2026-09-03,
+    when drill scenario 6b deleted TWRK_TAG and the restore put all 53,993
+    features back without it (DESIGN.md 11.1).
+
+    Separated from compare_schema because the two are asked at different
+    moments for different reasons. compare_schema runs afterwards and reports
+    everything; this runs before the delete and decides whether to stop.
+    """
+    current_fields = {field["name"] for field in current["fields"]}
+    return sorted(
+        field["name"] for field in expected["fields"]
+        if field["name"] not in current_fields
+    )
+
+
+def check_schema_fits(current, expected, accepted):
+    """Refuse, before anything is destroyed, if the artifact will not fit.
+
+    Everything needed has been available all along - the manifest carries the
+    fingerprint and describe_layer already reads the layer's fields - and the
+    comparison was simply happening after the append, when the layer had
+    already been emptied and refilled and the answer could change nothing.
+    Moving it in front of the delete is the same argument that already puts
+    the checksum verification first: destroy nothing until the replacement is
+    known to fit. DESIGN.md 11.1.
+
+    An acknowledgement rather than an outright refusal, because restoring
+    into a layer with a field missing is a legitimate thing to do on purpose -
+    it just has to be on purpose. The prerequisite nobody had written down is
+    that a restore following a schema change is a TWO-STEP operation: re-add
+    the field, then restore, and the artifact repopulates it.
+    """
+    if not expected:
+        logger.warning(
+            "The manifest records no schema fingerprint, so whether the "
+            "artifact fits this layer could not be checked before the delete."
+        )
+        return
+
+    missing = fields_the_layer_is_missing(current, expected)
+    if not missing:
+        logger.info("Schema fits: the layer has every field the artifact carries")
+        return
+
+    named = ", ".join(f"'{name}'" for name in missing)
+    if accepted:
+        logger.warning(
+            "The layer is missing %s, and --accept-schema-difference was "
+            "given. Those columns will be empty after the restore. The values "
+            "are in the artifact and are recoverable: re-add the field(s) and "
+            "restore again.", named,
+        )
+        return
+
+    raise ValueError(
+        f"The layer is missing {named}, which the artifact carries.\n"
+        f"A restore returns the data, not the schema: append writes into the "
+        f"layer's existing schema, so those fields would stay missing and "
+        f"their values would be silently dropped while the run reported "
+        f"success.\n"
+        f"Re-add the field(s) to the layer first, then restore - the artifact "
+        f"repopulates them. If the columns are meant to stay gone, re-run "
+        f"with --accept-schema-difference.\n"
+        f"Nothing has been touched."
+    )
+
+
 # ---------------------------------------------------------------------------
 # The operations
 # ---------------------------------------------------------------------------
@@ -421,13 +522,54 @@ def delete_in_chunks(layer, chunk_size):
             )
 
 
-def append_artifact(gis, layer, fgdb_path, feature_class, preserve_globalids):
-    """Upload the artifact and append it into the empty layer.
+def upload_artifact(gis, fgdb_path):
+    """Put the artifact on the server as a temporary item, and return it.
 
-    The append operation reads its source from an item, so the zip is uploaded
-    to the signed-in account's own content first and deleted in the finally
-    block below. That temporary item is the only thing this tool creates
-    anywhere, and it is the same pattern backup.py uses for its exports.
+    BEFORE THE DELETE, WHICH IS THE WHOLE REASON THIS IS ITS OWN FUNCTION.
+    The append operation reads its source from an item, so this upload
+    happens either way; doing it first costs only ordering and turns a
+    failure here from "the layer is empty and the restore cannot proceed"
+    into "nothing has been touched". The tool already refuses to delete until
+    the artifact's checksum is verified, on the principle that nothing is
+    destroyed until the replacement is proven - this extends that from the
+    file being intact to the server having accepted it. DESIGN.md 11.1.
+
+    Folder.add rather than gis.content.add. The latter warns as deprecated at
+    arcgis 2.3.0 and is REMOVED at 3.0.0. This repository pins 2.4.3 so
+    nothing breaks today, but this tool is written to be run by somebody else
+    at an unknown future date, quite possibly from an ArcGIS Pro conda
+    environment that upgrades on its own schedule - and on a newer arcgis the
+    old call would have emptied the layer, failed here, and never reached the
+    append. Discovered on the one day it is needed.
+
+    The temporary item is the only thing this tool creates anywhere. The
+    caller deletes it.
+    """
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    logger.info("Uploading %s to ArcGIS Online as a temporary item", fgdb_path.name)
+
+    # No folder argument, which means the signed-in account's root folder.
+    folder = gis.content.folders.get()
+    if folder is None:
+        raise ValueError(
+            f"Could not open the root content folder for the account signed "
+            f"in through {USERNAME_VARIABLE}. Nothing has been touched."
+        )
+    # Folder.add returns a job rather than the item; result() waits for it.
+    upload = folder.add(
+        item_properties=ItemProperties(
+            title=f"{UPLOAD_TITLE_PREFIX}{stamp}",
+            item_type=UPLOAD_ITEM_TYPE,
+            snippet="Temporary upload for a layer restore. Safe to delete.",
+        ),
+        file=str(fgdb_path),
+    ).result()
+    logger.info("Uploaded as item %s", upload.id)
+    return upload
+
+
+def append_uploaded(layer, upload, feature_class, preserve_globalids):
+    """Append the already-uploaded artifact into the empty layer.
 
     ON preserve_globalids: DESIGN.md 11.1 records the restore path as
     append(preserveGlobalIds=True). That is the REST parameter name; the
@@ -437,42 +579,34 @@ def append_artifact(gis, layer, fgdb_path, feature_class, preserve_globalids):
     comment to assert. The drill records what was observed. Nothing in this
     project currently depends on GlobalIDs either way.
     """
-    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    upload = None
     started = time.time()
-    try:
-        logger.info("Uploading %s to ArcGIS Online as a temporary item", fgdb_path.name)
-        upload = gis.content.add(
-            {
-                "title": f"{UPLOAD_TITLE_PREFIX}{stamp}",
-                "type": "File Geodatabase",
-                "snippet": "Temporary upload for a layer restore. Safe to delete.",
-            },
-            data=str(fgdb_path),
-        )
-        logger.info("Appending from '%s'", feature_class)
-        layer.append(
-            item_id=upload.id,
-            upload_format=UPLOAD_FORMAT,
-            source_table_name=feature_class,
-            use_globalids=preserve_globalids,
-            rollback=True,
-        )
-    finally:
-        if upload is not None:
-            try:
-                upload.delete()
-                logger.info("Deleted the temporary upload item")
-            except Exception as exc:
-                # Not fatal: the restore itself may have succeeded, and an
-                # orphaned upload in somebody's content folder is tidy-up
-                # rather than damage. Say so loudly enough to be tidied.
-                logger.warning(
-                    "Could not delete the temporary upload item %s (%s). "
-                    "Delete it by hand from the account's content.",
-                    upload.id, type(exc).__name__,
-                )
+    logger.info("Appending from '%s'", feature_class)
+    layer.append(
+        item_id=upload.id,
+        upload_format=UPLOAD_FORMAT,
+        source_table_name=feature_class,
+        use_globalids=preserve_globalids,
+        rollback=True,
+    )
     return time.time() - started
+
+
+def delete_upload(upload):
+    """Tidy the temporary item away, and never fail the run for it.
+
+    An orphaned upload in somebody's content folder is tidy-up rather than
+    damage, and by the time this runs the restore has either succeeded or
+    failed on its own merits. Said loudly enough to be tidied.
+    """
+    try:
+        upload.delete()
+        logger.info("Deleted the temporary upload item")
+    except Exception as exc:
+        logger.warning(
+            "Could not delete the temporary upload item %s (%s). "
+            "Delete it by hand from the account's content.",
+            upload.id, type(exc).__name__,
+        )
 
 
 def verify_restore(layer, entry):
@@ -556,6 +690,14 @@ def parse_arguments(argv):
     parser.add_argument(
         "--no-preserve-globalids", action="store_true",
         help="Append without asking the service to keep the source GlobalIDs.",
+    )
+    parser.add_argument(
+        "--accept-schema-difference", action="store_true",
+        help=(
+            "Proceed even though the layer is missing fields the artifact "
+            "carries. Those columns come back empty. Normally the answer is "
+            "to re-add the field and restore, which repopulates it."
+        ),
     )
     parser.add_argument(
         "--append-only", action="store_true",
@@ -666,6 +808,15 @@ def main(argv=None):
         if arguments.production:
             logger.info("  PRODUCTION    approved by %s", arguments.approved_by)
 
+        # Before the confirmation as well as before the delete, so that a run
+        # that cannot work says so without asking somebody to type a phrase
+        # first. It raises, and every raise in this file reaches the operator
+        # as an instruction rather than as an error.
+        check_schema_fits(
+            current["schema"], entry.get("schema_fingerprint"),
+            arguments.accept_schema_difference,
+        )
+
         if not arguments.execute:
             logger.info(
                 "Described only. Nothing has been changed. Add --execute to do it."
@@ -680,28 +831,38 @@ def main(argv=None):
 
         started = time.time()
         delete_seconds = 0.0
-        if arguments.append_only:
-            logger.info("Skipping the delete, as asked")
-        else:
-            delete_seconds = delete_all_features(layer, arguments.chunk_size)
-            logger.info("Layer emptied in %.1f minutes", delete_seconds / 60)
 
+        # The upload comes first, and this is the ordering DESIGN.md 11.1
+        # asks for. It happens either way, so putting it in front of the
+        # delete costs nothing - and a failure here, whether the file is
+        # rejected or the upload API has changed under a newer arcgis, now
+        # leaves a layer that still holds its data.
+        upload = upload_artifact(gis, fgdb_path)
         try:
-            append_seconds = append_artifact(
-                gis, layer, fgdb_path, feature_class,
-                preserve_globalids=not arguments.no_preserve_globalids,
-            )
-        except Exception:
-            # The dangerous window, and the one moment this tool must be
-            # loudest: the layer has been emptied and the replacement did not
-            # go in. Say what state it is in and exactly how to retry, because
-            # whoever is reading this is having a bad afternoon.
-            logger.error(
-                "THE APPEND FAILED AND THE LAYER IS EMPTY. The artifact is "
-                "intact at %s. Retry the append alone with the same command "
-                "plus --append-only; do not re-run the delete.", fgdb_path,
-            )
-            raise
+            if arguments.append_only:
+                logger.info("Skipping the delete, as asked")
+            else:
+                delete_seconds = delete_all_features(layer, arguments.chunk_size)
+                logger.info("Layer emptied in %.1f minutes", delete_seconds / 60)
+
+            try:
+                append_seconds = append_uploaded(
+                    layer, upload, feature_class,
+                    preserve_globalids=not arguments.no_preserve_globalids,
+                )
+            except Exception:
+                # The dangerous window, and the one moment this tool must be
+                # loudest: the layer has been emptied and the replacement did
+                # not go in. Say what state it is in and exactly how to retry,
+                # because whoever is reading this is having a bad afternoon.
+                logger.error(
+                    "THE APPEND FAILED AND THE LAYER IS EMPTY. The artifact is "
+                    "intact at %s. Retry the append alone with the same command "
+                    "plus --append-only; do not re-run the delete.", fgdb_path,
+                )
+                raise
+        finally:
+            delete_upload(upload)
 
         logger.info("Append finished in %.1f minutes", append_seconds / 60)
 

@@ -413,3 +413,132 @@ def test_globalids_are_preserved_unless_asked_otherwise():
     """DESIGN.md 11.1 makes preserving them the documented path. Whether the
     service actually honours it is what the restore drill records."""
     assert restore_layer.parse_arguments(BASE_ARGUMENTS).no_preserve_globalids is False
+
+
+# ---------------------------------------------------------------------------
+# The pre-flight, and the ordering that is the whole of it (DESIGN.md 11.1)
+#
+# Three things could be checked before the irreversible delete and none were.
+# Each one is about moving a check earlier rather than adding a new one, and
+# each was found the same way: by asking what state the layer would be in if
+# the next line failed.
+# ---------------------------------------------------------------------------
+
+
+def reduced_schema(*dropped):
+    """The layer's schema with fields removed, as a dropped field leaves it."""
+    schema = json.loads(json.dumps(restore_layer.schema_fingerprint(PROPERTIES)))
+    schema["fields"] = [f for f in schema["fields"] if f["name"] not in dropped]
+    return schema
+
+
+def test_a_layer_missing_a_field_the_artifact_has_is_refused_before_the_delete():
+    """Drill scenario 6b, as a known-answer test. The restore put all 53,993
+    features back and TWRK_TAG stayed gone, its column silently empty, and
+    the run reported success."""
+    artifact_schema = restore_layer.schema_fingerprint(PROPERTIES)
+
+    with pytest.raises(ValueError) as refused:
+        restore_layer.check_schema_fits(
+            reduced_schema("TWRK_TAG"), artifact_schema, accepted=False)
+
+    message = str(refused.value)
+    assert "TWRK_TAG" in message
+    assert "Nothing has been touched" in message
+    # And it says what to do, because the prerequisite is the part nobody had
+    # written down: re-add the field, then restore, and it repopulates.
+    assert "Re-add the field" in message
+
+
+def test_the_refusal_names_every_missing_field():
+    with pytest.raises(ValueError) as refused:
+        restore_layer.check_schema_fits(
+            reduced_schema("TWRK_TAG", "FEATURE_CODE"),
+            restore_layer.schema_fingerprint(PROPERTIES), accepted=False,
+        )
+
+    assert "TWRK_TAG" in str(refused.value)
+    assert "FEATURE_CODE" in str(refused.value)
+
+
+def test_a_schema_that_fits_passes_the_pre_flight():
+    fingerprint = restore_layer.schema_fingerprint(PROPERTIES)
+    assert restore_layer.check_schema_fits(fingerprint, fingerprint, accepted=False) is None
+
+
+def test_a_field_the_layer_has_and_the_artifact_does_not_is_not_a_refusal():
+    """Only the direction that loses data stops the run. An extra column in
+    the layer comes back empty and loses nothing, and refusing on it would
+    turn a harmless difference into a blocked recovery."""
+    artifact_schema = reduced_schema("TWRK_TAG")
+    layer_schema = restore_layer.schema_fingerprint(PROPERTIES)
+
+    assert restore_layer.check_schema_fits(
+        layer_schema, artifact_schema, accepted=False) is None
+
+
+def test_the_refusal_can_be_acknowledged_deliberately():
+    """Restoring into a layer with a field missing is a legitimate thing to
+    do on purpose. It just has to be on purpose."""
+    assert restore_layer.check_schema_fits(
+        reduced_schema("TWRK_TAG"),
+        restore_layer.schema_fingerprint(PROPERTIES),
+        accepted=True,
+    ) is None
+
+
+def test_a_manifest_with_no_fingerprint_does_not_block_the_restore():
+    """Warned about rather than refused. An old manifest is a reason to look,
+    not a reason to be unable to recover."""
+    assert restore_layer.check_schema_fits(
+        restore_layer.schema_fingerprint(PROPERTIES), None, accepted=False) is None
+
+
+def test_the_schema_check_runs_before_the_delete():
+    """Ordering, asserted on the source, because that is what the fix is.
+    Everything needed was available all along - the manifest carries the
+    fingerprint and describe_layer reads the layer's fields - and the
+    comparison was simply happening after the append, when the layer had
+    already been emptied and the answer could change nothing."""
+    source = restore_source()
+    assert (
+        source.index("        check_schema_fits(")
+        < source.index("delete_seconds = delete_all_features(")
+    )
+
+
+def test_the_upload_runs_before_the_delete():
+    """The upload happens either way, so putting it first costs only
+    ordering. On a newer arcgis the old order would have emptied the layer,
+    failed to upload, and never reached the append - discovered on the one
+    day it is needed."""
+    source = restore_source()
+    assert (
+        source.index("upload = upload_artifact(")
+        < source.index("delete_seconds = delete_all_features(")
+    )
+
+
+def test_the_deprecated_upload_call_is_gone():
+    """gis.content.add warns at arcgis 2.3.0 and is REMOVED at 3.0.0. This
+    repository pins 2.4.3, but the tool is written to be run by somebody else
+    at an unknown future date, quite possibly from an ArcGIS Pro conda
+    environment that upgrades on its own schedule."""
+    source = restore_source()
+    assert "gis.content.add(" not in source
+    assert "gis.content.folders.get()" in source
+
+
+def test_the_temporary_upload_is_still_always_tidied_away():
+    """It was deleted in a finally block when the upload and the append were
+    one function. Splitting them must not have dropped that."""
+    source = restore_source()
+    assert "delete_upload(upload)" in source
+    assert "        finally:\n            delete_upload(upload)" in source
+
+
+def test_accepting_a_schema_difference_takes_an_explicit_argument():
+    assert restore_layer.parse_arguments(
+        BASE_ARGUMENTS).accept_schema_difference is False
+    assert restore_layer.parse_arguments(
+        BASE_ARGUMENTS + ["--accept-schema-difference"]).accept_schema_difference is True

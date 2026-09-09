@@ -40,15 +40,31 @@ python restore/restore_layer.py \
     --fgdb path/to/points.gdb.zip
 ```
 
-This verifies the artifact's checksum against the manifest, reads the layer, and prints what it would do — how many features would be deleted, how many would be restored, when the artifact was taken. **It changes nothing.** Read it and check that the item is the one you mean.
+This verifies the artifact's checksum against the manifest, reads the layer, compares the layer's schema against the artifact's, and prints what it would do — how many features would be deleted, how many would be restored, when the artifact was taken. **It changes nothing.** Read it and check that the item is the one you mean.
 
 If the checksum does not match, stop and download the artifact again. There is no way to override it, on purpose: an artifact that cannot be verified is not something to empty a layer for.
 
-**If the problem included a deleted or renamed field, re-add it first.**
+### 1a. If it says the layer is missing a field, re-add it first
 
-A restore puts the data back, not the schema. `append` writes into whatever fields the layer currently has, so a field that was deleted stays deleted and its column comes back empty — the run reports success either way. Measured on a test copy: 53,993 features restored, one dropped field still missing.
+**A restore puts the data back, not the schema.** `append` writes into whatever fields the layer currently has, so a field that was deleted stays deleted and its column comes back empty — and the run reports success either way. Measured on a test copy: 53,993 features restored, one dropped field still missing.
 
-The values themselves are safe in the artifact. Add the field back with its original definition — `servicedef.json` in the same backup set records the exact name, type and length — and then restore, and the column repopulates.
+The tool checks this **before** it deletes anything and refuses:
+
+```
+The layer is missing 'TWRK_TAG', which the artifact carries.
+A restore returns the data, not the schema: ...
+Re-add the field(s) to the layer first, then restore - the artifact repopulates them.
+Nothing has been touched.
+```
+
+So a restore following a schema change is a **two-step operation**, and this is the step that is easy to skip:
+
+1. Add the field back with its original definition. `servicedef.json` in the same backup set records the exact name, type and length.
+2. Then restore. The column repopulates from the artifact.
+
+If the column is genuinely meant to stay gone, `--accept-schema-difference` proceeds and says plainly that those values are being dropped. Use it deliberately, not to get past the message.
+
+A field the *layer* has and the artifact does not is reported and does not stop anything — that column simply comes back empty, and nothing is lost that the artifact was holding.
 
 ### 2. Do it
 
@@ -70,7 +86,9 @@ It will ask you to type the item ID back before it does anything. If the target 
 
 With those, the confirmation becomes the layer's name rather than its item ID — a different phrase, because typing an item ID becomes automatic and this is the run where that matters.
 
-Then it deletes every feature, uploads the artifact as a temporary item, appends it, and deletes the temporary item again.
+Then, **in this order**: it uploads the artifact to ArcGIS Online as a temporary item, deletes every feature, appends from the uploaded item, and deletes the temporary item again.
+
+The upload comes first on purpose. It has to happen either way, so doing it before the delete costs nothing but ordering — and it means an upload that is rejected, or an ArcGIS Online API that has changed since this was written, leaves a layer that still holds its data instead of an empty one.
 
 **It runs long.** Both layers are tens of thousands of features. Leave it alone rather than interrupting it.
 
@@ -118,5 +136,7 @@ If the delete itself fails or times out, the tool falls back to deleting in chun
 The layers have sync enabled, which means `truncate` is unavailable and the delete is a bulk `delete_features` call instead. That is why the delete step is the slow and least predictable part, and why the chunked fallback exists.
 
 The tool asks the service to preserve the GlobalIDs from the artifact. Nothing in this project depends on them.
+
+The upload uses `Folder.add`. The older `gis.content.add` is deprecated at `arcgis` 2.3.0 and removed at 3.0.0, and this tool is written to be run at an unknown future date from whatever Python environment is to hand — quite possibly an ArcGIS Pro conda environment that upgrades on its own schedule.
 
 **Timings** are recorded in the drill log once the restore drill has been run at full scale, and belong here when they are.
