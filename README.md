@@ -11,6 +11,8 @@ This repository provides:
 1. **Scheduled backups** of both layers, retained on a rotating, monthly and yearly schedule in object storage.
 2. **Daily integrity checks** that measure the layers, compare against history, and raise an alert when something looks wrong.
 
+This README is the developer's entry point. For the user guide (what an alert means and what to do about it) and the fuller developer guide, see the [documentation site](https://bcgov.github.io/nr-water-licensed-works-backup/).
+
 
 ## The pipeline never modifies production data
 
@@ -24,7 +26,7 @@ Everything here is **read-only** with respect to the production feature layers. 
 
 Restore procedures are documented runbooks carried out by a person. Any tooling written to support them stays outside the pipeline, is never referenced by a workflow, and requires explicit arguments and typed confirmation.
 
-`restore/restore_layer.py` is that tooling, and the exception that proves the rule above: it is the one file here that can delete a feature. It is a resource for the data owner, not part of anything scheduled. Nothing imports it, no workflow can reach it, it reads no configuration and holds no object storage credentials, it authenticates only through `AGO_USERNAME_RESTORE` / `AGO_PASSWORD_RESTORE` rather than the pipeline's own credentials, it verifies the artifact's checksum before it deletes anything, and it changes nothing without `--execute` and a typed confirmation. The two production items are refused outright unless the run explicitly names who approved it. `tests/test_restore.py` asserts each of those as a property rather than trusting them as a convention. The procedure is [docs/RESTORE_inplace.md](docs/RESTORE_inplace.md).
+`restore/restore_layer.py` is that tooling, and the exception that proves the rule above: it is the one file here that can delete a feature. It is a resource for the data owner, not part of anything scheduled. Nothing imports it, no workflow can reach it, it reads no configuration and holds no object storage credentials, it authenticates only through `AGO_USERNAME_RESTORE` / `AGO_PASSWORD_RESTORE` rather than the pipeline's own credentials, it verifies the artifact's checksum before it deletes anything, and it changes nothing without `--execute` and a typed confirmation. The two production items are refused outright unless the run explicitly names who approved it. `tests/test_restore.py` asserts each of those as a property rather than trusting them as a convention. The procedure is [docs/developer-guide/restore-inplace.md](docs/developer-guide/restore-inplace.md).
 
 
 ## How it works

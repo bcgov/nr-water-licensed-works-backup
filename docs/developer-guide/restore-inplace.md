@@ -1,3 +1,9 @@
+---
+title: Restoring a layer in place
+parent: Developer Guide
+nav_order: 4
+---
+
 # Restoring a layer in place
 
 How to put a hosted feature layer back to the state a backup artifact holds, keeping the item ID, service URL, sharing, symbology and subtypes exactly as they are.
@@ -139,4 +145,4 @@ The tool asks the service to preserve the GlobalIDs from the artifact. Nothing i
 
 The upload uses `Folder.add`. The older `gis.content.add` is deprecated at `arcgis` 2.3.0 and removed at 3.0.0, and this tool is written to be run at an unknown future date from whatever Python environment is to hand — quite possibly an ArcGIS Pro conda environment that upgrades on its own schedule.
 
-**Timings** are recorded in the drill log once the restore drill has been run at full scale, and belong here when they are.
+**Timings, measured on the restore drill at full scale:** points took 36 seconds; lines took under two minutes. The data operation is not the slow part of a recovery — deciding to do it is.

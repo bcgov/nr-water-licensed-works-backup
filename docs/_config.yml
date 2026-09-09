@@ -1,0 +1,64 @@
+# Jekyll configuration for the Water Licensed Works Backup documentation site.
+# Published via GitHub Pages from the /docs folder on the main branch.
+title: Water Licensed Works — Backup and Integrity Checks
+description: >-
+  Documentation for the scheduled backups and daily integrity checks that
+  protect the Water Licensed Works lines and points layers in ArcGIS Online.
+
+# just-the-docs, pulled in as a remote theme (no local build needed).
+remote_theme: just-the-docs/just-the-docs
+
+# Site URL — GitHub Pages for the bcgov/nr-water-licensed-works-backup repo.
+url: https://bcgov.github.io
+baseurl: /nr-water-licensed-works-backup
+
+# Clean URLs: docs/user-guide/alerts.md -> /user-guide/alerts/
+permalink: pretty
+
+# --- just-the-docs options -------------------------------------------------
+search_enabled: true
+heading_anchors: true
+color_scheme: light
+back_to_top: true
+back_to_top_text: "Back to top"
+
+aux_links:
+  "GitHub repository":
+    - https://github.com/bcgov/nr-water-licensed-works-backup
+aux_links_new_tab: true
+
+# Shown at the bottom of every page. The code is Apache 2.0 (see LICENSE in
+# the repo root); this site's content is CC BY 4.0, per B.C. government
+# open source licensing guidance.
+footer_content: >-
+  Copyright &copy; 2026 Province of British Columbia. Documentation licensed
+  under <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>.
+  Code licensed under <a
+  href="https://github.com/bcgov/nr-water-licensed-works-backup/blob/main/LICENSE">Apache
+  2.0</a>.
+
+# "Edit this page on GitHub" link in the page footer.
+gh_edit_link: true
+gh_edit_link_text: "Edit this page on GitHub"
+gh_edit_repository: https://github.com/bcgov/nr-water-licensed-works-backup
+gh_edit_branch: main
+gh_edit_view_mode: tree
+gh_edit_source: docs
+
+# --- Jekyll ----------------------------------------------------------------
+plugins:
+  - jekyll-remote-theme
+  - jekyll-seo-tag
+
+# Apply the theme's default layout to every page so individual pages
+# don't need to declare it.
+defaults:
+  - scope:
+      path: ""
+    values:
+      layout: default
+
+exclude:
+  - Gemfile
+  - Gemfile.lock
+  - vendor
