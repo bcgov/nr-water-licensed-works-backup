@@ -75,7 +75,7 @@ LINES_THRESHOLDS = {
     "extent": {"drift_metres": 5000, "severity": "WARN"},
     "total_length": {"change_percent": 10, "severity": "WARN"},
     "schema": {"rule": "exact_match", "severity": "FAIL"},
-    "null_rate": {"increase_percent": 5, "severity": "WARN"},
+    "missing_rate": {"increase_percent": 5, "severity": "WARN"},
 }
 
 SCHEMA = {
@@ -95,8 +95,8 @@ def metrics(**overrides):
         "feature_count": 142523,
         "extent": {"xmin": 488114.0, "ymin": 371075.0, "xmax": 1841275.0, "ymax": 1693633.0},
         "total_length": 32766296.0,
-        "null_counts": {"TWRK_TAG": 6957},
-        "null_rates_percent": {"TWRK_TAG": 4.88},
+        "missing_counts": {"TWRK_TAG": 6957},
+        "missing_rates_percent": {"TWRK_TAG": 4.88},
         "distinct_value_field": "FEATURE_CODE",
         "value_counts": {"EA06100200": 70766, "EA21400610": 71757},
         "schema_fingerprint": SCHEMA,
@@ -347,7 +347,7 @@ def test_extent_within_tolerance_passes():
 
 
 # ---------------------------------------------------------------------------
-# Total length, schema, nulls, distinct values
+# Total length, schema, missing values, distinct values
 # ---------------------------------------------------------------------------
 
 def test_total_length_change_warns():
@@ -403,27 +403,27 @@ def test_an_unchanged_schema_passes():
     assert checks.check_schema("lines", metrics(), metrics(), LINES_THRESHOLDS) == []
 
 
-def test_null_rate_increase_is_measured_in_percentage_points():
-    """0.1% to 5.1% null is a rise of 5.0 points, not 5,000%."""
-    found = checks.check_null_rate(
-        "lines", metrics(null_rates_percent={"TWRK_TAG": 5.2}),
-        metrics(null_rates_percent={"TWRK_TAG": 0.1}), LINES_THRESHOLDS,
+def test_missing_rate_increase_is_measured_in_percentage_points():
+    """0.1% to 5.1% missing is a rise of 5.0 points, not 5,000%."""
+    found = checks.check_missing_rate(
+        "lines", metrics(missing_rates_percent={"TWRK_TAG": 5.2}),
+        metrics(missing_rates_percent={"TWRK_TAG": 0.1}), LINES_THRESHOLDS,
     )
     assert len(found) == 1
     assert found[0].severity == "WARN"
 
-    within = checks.check_null_rate(
-        "lines", metrics(null_rates_percent={"TWRK_TAG": 5.0}),
-        metrics(null_rates_percent={"TWRK_TAG": 0.1}), LINES_THRESHOLDS,
+    within = checks.check_missing_rate(
+        "lines", metrics(missing_rates_percent={"TWRK_TAG": 5.0}),
+        metrics(missing_rates_percent={"TWRK_TAG": 0.1}), LINES_THRESHOLDS,
     )
     assert within == []
 
 
-def test_a_falling_null_rate_is_not_a_violation():
+def test_a_falling_missing_rate_is_not_a_violation():
     """Somebody filling in missing tags is the data getting better."""
-    assert checks.check_null_rate(
-        "lines", metrics(null_rates_percent={"TWRK_TAG": 0.1}),
-        metrics(null_rates_percent={"TWRK_TAG": 5.2}), LINES_THRESHOLDS,
+    assert checks.check_missing_rate(
+        "lines", metrics(missing_rates_percent={"TWRK_TAG": 0.1}),
+        metrics(missing_rates_percent={"TWRK_TAG": 5.2}), LINES_THRESHOLDS,
     ) == []
 
 
@@ -485,9 +485,10 @@ def test_the_identifiers_have_to_agree_with_the_count():
     disagree mean one of them is wrong, and naming records that may not be the
     offending ones is worse than naming none."""
     with pytest.raises(RuntimeError, match="one of the two queries is wrong"):
-        checks.checked_outlier_objectids("points", [], 2000)
+        checks.checked_objectids("points", [], 2000, "outside the grid envelope")
     with pytest.raises(RuntimeError, match="No metrics file has been written"):
-        checks.checked_outlier_objectids("points", list(range(2000)), 2)
+        checks.checked_objectids(
+            "points", list(range(2000)), 2, "outside the grid envelope")
 
 
 def test_a_feature_edited_during_the_run_is_not_treated_as_a_fault():
@@ -495,8 +496,9 @@ def test_a_feature_edited_during_the_run_is_not_treated_as_a_fault():
     and the two queries are moments apart, so a feature or two of disagreement
     is a concurrent edit rather than a malformed query. Same tolerance and
     same reasoning as everywhere else in this file."""
-    assert checks.checked_outlier_objectids(
-        "points", [150984, 150985], 2 + checks.LIVE_EDIT_TOLERANCE) == [150984, 150985]
+    assert checks.checked_objectids(
+        "points", [150984, 150985], 2 + checks.LIVE_EDIT_TOLERANCE,
+        "outside the grid envelope") == [150984, 150985]
 
 
 def test_the_recorded_identifiers_are_capped():
@@ -504,7 +506,8 @@ def test_the_recorded_identifiers_are_capped():
     metrics file written every day is not the place to accumulate an unbounded
     list."""
     found = list(range(150900, 150900 + 40))
-    kept = checks.checked_outlier_objectids("points", found, len(found))
+    kept = checks.checked_objectids(
+        "points", found, len(found), "outside the grid envelope")
 
     assert kept == found[:checks.MAX_OBJECTIDS_NAMED]
 
@@ -512,8 +515,8 @@ def test_the_recorded_identifiers_are_capped():
 def test_the_two_known_records_pass_the_guard_and_are_recorded():
     """The live reading on points, every run since the first: exactly two,
     OBJECTID 150984 and 150985 (DESIGN.md 4)."""
-    assert checks.checked_outlier_objectids(
-        "points", [150984, 150985], 2) == [150984, 150985]
+    assert checks.checked_objectids(
+        "points", [150984, 150985], 2, "outside the grid envelope") == [150984, 150985]
 
 
 def test_a_record_outside_bc_is_reported_with_no_history_at_all():
@@ -1106,63 +1109,106 @@ class StandInLayer:
 
     url = "https://example.invalid/FeatureServer/0"
 
-    def __init__(self, feature_count=100):
+    def __init__(self, feature_count=100, dropped_fields=(), missing_count=0,
+                 null_geometry_objectids=()):
         self.feature_count = feature_count
+        self.dropped_fields = set(dropped_fields)
+        self.missing_count = missing_count
+        # Features counted by the layer and matched by neither spatial
+        # predicate, so the partition below has to account for them.
+        self.null_geometry_objectids = list(null_geometry_objectids)
+        all_fields = [
+            {"name": "OBJECTID", "type": "esriFieldTypeOID"},
+            {"name": "TWRK_TAG", "type": "esriFieldTypeString"},
+            {"name": "FEATURE_CODE", "type": "esriFieldTypeString",
+             "domain": {"type": "codedValue", "name": "LWL_FCODES",
+                        "codedValues": [{"code": "AA01"}]}},
+        ]
         self.properties = {
             "objectIdField": "OBJECTID",
-            "fields": [
-                {"name": "OBJECTID", "type": "esriFieldTypeOID"},
-                {"name": "TWRK_TAG", "type": "esriFieldTypeString"},
-                {"name": "FEATURE_CODE", "type": "esriFieldTypeString",
-                 "domain": {"type": "codedValue", "name": "LWL_FCODES",
-                            "codedValues": [{"code": "AA01"}]}},
-            ],
+            "fields": [f for f in all_fields if f["name"] not in self.dropped_fields],
             "types": [],
             "editingInfo": {"lastEditDate": 1755000000000},
         }
         self._con = self
 
+    def reject_dropped(self, text):
+        """What the service does when asked about a field that is gone.
+
+        A 400 with 'Invalid field', which the arcgis wrapper surfaces as an
+        exception. Reproduced here because the fix in checks.py is to never
+        issue the query, and a stand-in that answered anyway would let a
+        regression pass.
+        """
+        for field_name in self.dropped_fields:
+            if field_name in text:
+                raise ValueError(
+                    f"{{'error': {{'code': 400, 'details': "
+                    f"[\"'Invalid field: {field_name}' parameter is invalid\"]}}}}"
+                )
+
     def post(self, url, params):
         """The two raw REST calls: grouped value counts, and ids outside."""
         if params.get("returnIdsOnly") == "true":
+            if params.get("where") == checks.NULL_GEOMETRY_WHERE:
+                return {"objectIds": list(self.null_geometry_objectids)}
             return {"objectIds": []}
+        self.reject_dropped(params.get("groupByFieldsForStatistics", ""))
         return {"features": [
             {"attributes": {"FEATURE_CODE": "AA01", "value_count": self.feature_count}}
         ]}
 
     def query(self, where="1=1", **kwargs):
+        self.reject_dropped(where)
+        self.reject_dropped(str(kwargs.get("out_statistics", "")))
         if kwargs.get("return_count_only"):
-            # Every envelope query lands one feature in one cell, and the
-            # disjoint half returns nothing, so the partition adds up.
+            # A feature with no geometry is in no cell and on neither side of
+            # the partition, so every envelope query below returns only the
+            # ones that have one.
+            with_geometry = self.feature_count - len(self.null_geometry_objectids)
             if kwargs.get("geometry_filter", {}).get("spatialRel") == "esriSpatialRelDisjoint":
                 return 0
             if "geometry_filter" in kwargs:
-                return self.feature_count if "1350" in str(kwargs) else 0
+                return with_geometry if "1350" in str(kwargs) else 0
+            if where == checks.NULL_GEOMETRY_WHERE:
+                return len(self.null_geometry_objectids)
             if "IS NULL" in where:
-                return 0
+                return self.missing_count
             return self.feature_count
         if kwargs.get("return_extent_only"):
             return {"extent": {"xmin": 1.0, "ymin": 2.0, "xmax": 3.0, "ymax": 4.0}}
         raise AssertionError(f"unexpected query: {where} {kwargs}")
 
 
+def stand_in_layer_config(**overrides):
+    """The config.yml layers entry the stand-in above answers for."""
+    layer_config = {"name": "TEST", "item_id": "abc", "layer_index": 0,
+                    "has_length_field": False, "distinct_value_field": "FEATURE_CODE",
+                    "missing_check_fields": ["TWRK_TAG", "FEATURE_CODE"]}
+    layer_config.update(overrides)
+    return layer_config
+
+
+def stand_in_config():
+    """A one-cell grid over the square the stand-in puts its features in."""
+    return {"checks": {"spatial_grid": {
+        "xmin": 1350000, "ymin": 950000, "xmax": 1400000, "ymax": 1000000,
+        "cell_size_metres": 50000, "wkid": 3005, "max_sum_overcount_percent": 2}}}
+
+
 def test_collect_layer_metrics_collects_all_of_it(monkeypatch):
     """The shape of a real metrics entry, field for field. An early return
     anywhere in this function is silent: the run still passes, still writes a
     file, and the file is missing most of what the rules read."""
-    layer_config = {"name": "TEST", "item_id": "abc", "layer_index": 0,
-                    "has_length_field": False, "distinct_value_field": "FEATURE_CODE",
-                    "null_check_fields": ["TWRK_TAG", "FEATURE_CODE"]}
-    grid = {"xmin": 1350000, "ymin": 950000, "xmax": 1400000, "ymax": 1000000,
-            "cell_size_metres": 50000, "wkid": 3005, "max_sum_overcount_percent": 2}
-    config = {"checks": {"spatial_grid": grid}}
+    layer_config = stand_in_layer_config()
+    config = stand_in_config()
 
     monkeypatch.setattr(checks, "open_layer", lambda gis, cfg: StandInLayer(100))
     metrics = checks.collect_layer_metrics(None, "points", layer_config, config)
 
     assert set(metrics) >= {
         "feature_count", "extent", "schema_fingerprint", "last_edit_utc",
-        "null_counts", "null_rates_percent", "distinct_value_field",
+        "missing_counts", "missing_rates_percent", "distinct_value_field",
         "value_counts", "domain_coded_values", "values_outside_domain",
         "spatial_bins", "spatial_bins_populated", "features_inside_grid",
         "features_outside_grid", "objectids_outside_grid", "query_retries",
@@ -1177,7 +1223,7 @@ def test_an_empty_layer_returns_early_and_says_so(monkeypatch):
     It still records the retry count, so the field is never missing."""
     layer_config = {"name": "TEST", "item_id": "abc", "layer_index": 0,
                     "has_length_field": False, "distinct_value_field": "FEATURE_CODE",
-                    "null_check_fields": ["TWRK_TAG"]}
+                    "missing_check_fields": ["TWRK_TAG"]}
     config = {"checks": {"spatial_grid": {
         "xmin": 0, "ymin": 0, "xmax": 50000, "ymax": 50000,
         "cell_size_metres": 50000, "wkid": 3005, "max_sum_overcount_percent": 2}}}
@@ -1188,3 +1234,377 @@ def test_an_empty_layer_returns_early_and_says_so(monkeypatch):
     assert metrics["feature_count"] == 0
     assert "spatial_bins" not in metrics
     assert metrics["query_retries"] == 0
+
+
+# ---------------------------------------------------------------------------
+# A dropped field (DESIGN.md 7.6.5)
+#
+# Drill scenario 6b deleted TWRK_TAG from the points test copy and expected
+# DATA_FAIL: the schema changed. The run reported SYSTEM_FAIL instead - the
+# per-field missing-value query was rejected, collection aborted, and the
+# fingerprint that would have named the field was thrown away with it. That
+# routes to the developer rather than the data owner, writes no metrics, and
+# in Phase 2 fails OPEN, because the staging script aborts on DATA_FAIL only.
+#
+# The stand-in raises on a query naming a dropped field, exactly as the
+# service does, so these tests fail if the query is ever issued again.
+# ---------------------------------------------------------------------------
+
+
+def test_a_dropped_field_does_not_abort_collection(monkeypatch):
+    monkeypatch.setattr(
+        checks, "open_layer", lambda gis, cfg: StandInLayer(100, ["TWRK_TAG"])
+    )
+    metrics = checks.collect_layer_metrics(
+        None, "points", stand_in_layer_config(), stand_in_config()
+    )
+
+    assert metrics["absent_fields"] == ["TWRK_TAG"]
+    assert "TWRK_TAG" not in metrics["missing_counts"]
+    # Everything else was still measured, which is the whole point: the run
+    # keeps its feature count, its grid and its fingerprint.
+    assert metrics["feature_count"] == 100
+    assert metrics["missing_counts"] == {"FEATURE_CODE": 0}
+    assert metrics["spatial_bins_populated"] == 1
+
+
+def test_a_dropped_field_is_a_data_failure_naming_the_field(monkeypatch):
+    """The consequence that matters. It has to reach the rules as a schema
+    change - DATA_FAIL, to the data owner, naming the field - rather than as
+    a system failure the client is never told about."""
+    monkeypatch.setattr(
+        checks, "open_layer", lambda gis, cfg: StandInLayer(100, ["TWRK_TAG"])
+    )
+    today = checks.collect_layer_metrics(
+        None, "points", stand_in_layer_config(), stand_in_config()
+    )
+    monkeypatch.setattr(checks, "open_layer", lambda gis, cfg: StandInLayer(100))
+    yesterday = checks.collect_layer_metrics(
+        None, "points", stand_in_layer_config(), stand_in_config()
+    )
+
+    violations = checks.check_schema(
+        "points", today, yesterday, {"schema": {"rule": "exact_match", "severity": "FAIL"}}
+    )
+
+    assert len(violations) == 1
+    assert "TWRK_TAG" in violations[0].message
+    assert "removed" in violations[0].message
+    assert checks.status_from(violations, has_comparison=True) == "DATA_FAIL"
+
+
+def test_dropping_the_works_type_field_leaves_no_values_rather_than_no_run(monkeypatch):
+    """FEATURE_CODE drives the grouped value counts as well as a missing count,
+    and the grouped query is rejected the same way."""
+    monkeypatch.setattr(
+        checks, "open_layer", lambda gis, cfg: StandInLayer(100, ["FEATURE_CODE"])
+    )
+    metrics = checks.collect_layer_metrics(
+        None, "points", stand_in_layer_config(), stand_in_config()
+    )
+
+    assert metrics["absent_fields"] == ["FEATURE_CODE"]
+    assert metrics["value_counts"] == {}
+    assert metrics["values_outside_domain"] == []
+    assert metrics["missing_counts"] == {"TWRK_TAG": 0}
+    assert metrics["feature_count"] == 100
+
+
+def test_a_dropped_length_field_is_recorded_and_not_summed(monkeypatch):
+    """Shape__Length is configured per layer by has_length_field, so it is a
+    configured field name like the others and gets the same treatment."""
+    monkeypatch.setattr(
+        checks, "open_layer", lambda gis, cfg: StandInLayer(100, ["Shape__Length"])
+    )
+    metrics = checks.collect_layer_metrics(
+        None, "lines", stand_in_layer_config(has_length_field=True), stand_in_config()
+    )
+
+    assert metrics["absent_fields"] == ["Shape__Length"]
+    assert "total_length" not in metrics
+
+
+def test_every_configured_field_present_leaves_the_absent_list_empty(monkeypatch):
+    monkeypatch.setattr(checks, "open_layer", lambda gis, cfg: StandInLayer(100))
+    metrics = checks.collect_layer_metrics(
+        None, "points", stand_in_layer_config(), stand_in_config()
+    )
+
+    assert metrics["absent_fields"] == []
+
+
+# ---------------------------------------------------------------------------
+# Missing values, by null or by blank string (DESIGN.md 7.6.3)
+#
+# The rule exists to catch a failed field calculation. ArcGIS Pro's Calculate
+# Field blanks a text field by writing an empty string, so `IS NULL` alone
+# could not see the thing it was written for: drill scenario 7 blanked 3,068
+# works tags and the metric moved by zero. What is under test here is which
+# SQL gets issued, so the stand-in below answers by where clause.
+# ---------------------------------------------------------------------------
+
+
+class RecordingLayer:
+    """Answers a count query from a table of where clauses, and remembers.
+
+    The two forms return the numbers actually measured on the points service
+    on 2026-09-03, so a revert to `IS NULL` alone does not merely fail - it
+    fails with the real 5.4x gap in the message.
+    """
+
+    def __init__(self, counts):
+        self.counts = counts
+        self.asked = []
+
+    def query(self, where="1=1", **kwargs):
+        self.asked.append(where)
+        if where not in self.counts:
+            raise AssertionError(f"unexpected where clause: {where}")
+        return self.counts[where]
+
+
+def test_missing_count_counts_blank_strings_as_well_as_nulls():
+    layer = RecordingLayer({
+        "TWRK_TAG IS NULL": 4995,
+        "TWRK_TAG IS NULL OR TWRK_TAG = ''": 26990,
+    })
+
+    assert checks.query_missing_count(layer, "TWRK_TAG") == 26990
+    assert layer.asked == ["TWRK_TAG IS NULL OR TWRK_TAG = ''"]
+
+
+def test_a_field_with_no_blanks_reads_the_same_either_way():
+    """The change moves the number only where blanks exist, which is what
+    makes the forty-point jump on TWRK_TAG a definition change and not a
+    fault in the new query."""
+    layer = RecordingLayer({"FEATURE_CODE IS NULL OR FEATURE_CODE = ''": 33})
+
+    assert checks.query_missing_count(layer, "FEATURE_CODE") == 33
+
+
+def test_a_blanked_field_now_moves_the_rate(monkeypatch):
+    """Scenario 7, as a known-answer test: half the layer blanked, and the
+    rate has to follow it."""
+    monkeypatch.setattr(
+        checks, "open_layer", lambda gis, cfg: StandInLayer(100, missing_count=50)
+    )
+    metrics = checks.collect_layer_metrics(
+        None, "points", stand_in_layer_config(), stand_in_config()
+    )
+
+    assert metrics["missing_counts"] == {"TWRK_TAG": 50, "FEATURE_CODE": 50}
+    assert metrics["missing_rates_percent"] == {"TWRK_TAG": 50.0, "FEATURE_CODE": 50.0}
+
+
+def test_the_rate_rule_fires_on_a_blanked_field():
+    found = checks.check_missing_rate(
+        "points", metrics(missing_rates_percent={"TWRK_TAG": 55.0}),
+        metrics(missing_rates_percent={"TWRK_TAG": 49.99}), LINES_THRESHOLDS,
+    )
+
+    assert [v.rule for v in found] == ["missing_rate"]
+    assert statuses(found) == "WARN"
+
+
+# ---------------------------------------------------------------------------
+# The re-baseline, and why it needed no suppression
+#
+# A dated suppression was written into config.yml for the 2026-09-08 change
+# and removed the same day: the run proved there was nothing to suppress,
+# because the metric was renamed along with the query. check_missing_rate
+# reads missing_rates_percent, no file written before that day holds one, and
+# a rule with no comparison raises nothing.
+#
+# That is a better mechanism than a dated window - it cannot be got wrong by
+# guessing the wrong dates - and it has the same cost, which is that the rule
+# did not run that day. Both halves are asserted here.
+# ---------------------------------------------------------------------------
+
+
+def test_the_rule_is_silent_across_the_rename_rather_than_raising_forty_points():
+    """The real numbers either side, from the production files of 2026-09-07
+    and 2026-09-08. A forty-point move would be a WARN, and WARN now reaches
+    the data owner - so if this ever starts firing on a rename, somebody gets
+    an unexplained alert about a definition change."""
+    before = metrics()
+    before.pop("missing_rates_percent")
+    before["null_rates_percent"] = {"TWRK_TAG": 9.2557}
+    after = metrics(missing_rates_percent={"TWRK_TAG": 49.9880})
+
+    assert checks.check_missing_rate("points", after, before, LINES_THRESHOLDS) == []
+
+
+def test_the_rule_is_live_again_the_run_after():
+    """Both sides written under the new definition, so the comparison is real
+    and a genuine blanking is caught."""
+    found = checks.check_missing_rate(
+        "points", metrics(missing_rates_percent={"TWRK_TAG": 60.0}),
+        metrics(missing_rates_percent={"TWRK_TAG": 49.988}), LINES_THRESHOLDS,
+    )
+
+    assert [v.rule for v in found] == ["missing_rate"]
+
+
+def test_the_suppressions_block_is_empty_in_normal_operation():
+    """It is not a place to accumulate expired entries. A block nobody reads
+    is one nobody reads before adding the next."""
+    assert load_real_config()["suppressions"] == []
+
+
+# ---------------------------------------------------------------------------
+# Null geometry (DESIGN.md 4.2, 7.6.2)
+#
+# A feature with no geometry is counted by `where=1=1` and matched by neither
+# spatial predicate, so each one moved the partition sum by exactly one and
+# LIVE_EDIT_TOLERANCE absorbed it. At six the guard raised, the run reported
+# SYSTEM_FAIL and wrote NO METRICS AT ALL - a handful of bad records blinding
+# the whole integrity check, daily, until data belonging to another
+# organisation was corrected.
+#
+# Lines stood at three on 2026-09-01 and at one on 2026-09-08 (OBJECTID
+# 420170); points has never had any.
+# ---------------------------------------------------------------------------
+
+
+def test_six_null_geometries_no_longer_stop_the_run(monkeypatch):
+    """The number that mattered. Five was silently absorbed and six raised."""
+    monkeypatch.setattr(
+        checks, "open_layer",
+        lambda gis, cfg: StandInLayer(100, null_geometry_objectids=range(420170, 420176)),
+    )
+    metrics = checks.collect_layer_metrics(
+        None, "lines", stand_in_layer_config(), stand_in_config()
+    )
+
+    assert metrics["features_with_null_geometry"] == 6
+    assert metrics["objectids_with_null_geometry"] == list(range(420170, 420176))
+    # And the run kept everything it used to throw away.
+    assert metrics["feature_count"] == 100
+    assert metrics["spatial_bins_populated"] == 1
+    assert metrics["features_inside_grid"] == 94
+
+
+def test_the_guard_still_fails_on_a_partition_that_does_not_add_up():
+    """The property that must not be lost. This guard has caught three
+    well-formed wrong answers already (DESIGN.md 12) and its whole value is
+    that it fails loudly on a malformed filter. Twenty features unaccounted
+    for and unexplained still stops the run."""
+    layer = StandInLayer(100, null_geometry_objectids=range(420170, 420190))
+
+    with pytest.raises(RuntimeError, match="not returning a partition"):
+        checks.assert_grid_partitions_layer(
+            layer, "lines", {"1350_950": 80}, 100,
+            stand_in_config()["checks"]["spatial_grid"], null_geometry_count=0,
+        )
+
+
+def test_the_guard_accepts_the_same_gap_once_it_has_been_measured():
+    """And the pair that makes the change worth anything: the identical gap
+    passes when a separate query has accounted for it. Subtracted from a
+    measured number rather than absorbed by a wider tolerance, which is what
+    keeps the test above true."""
+    layer = StandInLayer(100, null_geometry_objectids=range(420170, 420190))
+
+    inside, outside = checks.assert_grid_partitions_layer(
+        layer, "lines", {"1350_950": 80}, 100,
+        stand_in_config()["checks"]["spatial_grid"], null_geometry_count=20,
+    )
+
+    assert (inside, outside) == (80, 0)
+
+
+def test_the_guard_message_names_the_null_geometries_rather_than_the_query():
+    """The old message read 'the geometry filter is not returning a
+    partition', which sent whoever was on call to the query code when the
+    fault was in the data. The arithmetic the reader is asked to trust has to
+    be in front of them."""
+    # Thirty features with no geometry, twenty of them measured: the ten the
+    # count does not explain are what a malformed filter would look like.
+    layer = StandInLayer(100, null_geometry_objectids=range(420170, 420200))
+
+    with pytest.raises(RuntimeError) as raised:
+        checks.assert_grid_partitions_layer(
+            layer, "lines", {"1350_950": 70}, 100,
+            stand_in_config()["checks"]["spatial_grid"], null_geometry_count=20,
+        )
+
+    assert "80 features that have a geometry" in str(raised.value)
+    assert "100 in the layer, 20 with none" in str(raised.value)
+
+
+def test_the_null_geometry_finding_names_the_records():
+    finding = checks.null_geometry_finding("lines", {
+        "features_with_null_geometry": 3,
+        "objectids_with_null_geometry": [420170, 422788, 422789],
+    })
+
+    assert finding == (
+        "lines: 3 features have no geometry (OBJECTID 420170, 422788, 422789)."
+    )
+
+
+def test_one_null_geometry_reads_as_a_sentence():
+    """The live reading on lines at 2026-09-08. It is read by the data owner
+    in an email, not only by us in a log."""
+    finding = checks.null_geometry_finding("lines", {
+        "features_with_null_geometry": 1,
+        "objectids_with_null_geometry": [420170],
+    })
+
+    assert finding == "lines: 1 feature has no geometry (OBJECTID 420170)."
+
+
+def test_no_null_geometry_produces_no_finding():
+    assert checks.null_geometry_finding("points", {
+        "features_with_null_geometry": 0, "objectids_with_null_geometry": [],
+    }) is None
+
+
+def test_the_null_geometry_finding_is_not_a_rule_and_does_not_block_promotion(monkeypatch):
+    """The most important property of a finding, asserted for the second one
+    as it already is for the first. A severity here would hold the status off
+    PASS for as long as the records stood, and backup.promote_monthly would
+    never promote again - three records nobody disputes costing every monthly
+    restore point. DESIGN.md 7.6.1."""
+    measurements = {
+        "lines": metrics(
+            features_outside_grid=0, objectids_outside_grid=[],
+            features_with_null_geometry=3,
+            objectids_with_null_geometry=[420170, 422788, 422789],
+        ),
+        "points": metrics(
+            feature_count=53987, features_outside_grid=0, objectids_outside_grid=[],
+            features_with_null_geometry=0, objectids_with_null_geometry=[],
+        ),
+    }
+    result, written = run_checks_with(monkeypatch, measurements, history=[
+        {"date_stamp": "2026-09-07", "status": "PASS",
+         "layers": {"lines": metrics(), "points": metrics(feature_count=53987)}},
+    ])
+
+    assert result.status == "PASS"
+    assert result.failures == []
+    assert any("no geometry" in line for line in result.details)
+    assert written["validity_findings"] == [
+        "lines: 3 features have no geometry (OBJECTID 420170, 422788, 422789)."
+    ]
+
+
+def test_both_findings_on_one_run_are_both_reported(monkeypatch):
+    """One email per run carries everything it found, so both have to be in
+    the details and in the summary."""
+    measurements = {
+        "points": metrics(
+            features_outside_grid=2, objectids_outside_grid=[150984, 150985],
+            features_with_null_geometry=0, objectids_with_null_geometry=[],
+        ),
+        "lines": metrics(
+            features_outside_grid=0, objectids_outside_grid=[],
+            features_with_null_geometry=1, objectids_with_null_geometry=[420170],
+        ),
+    }
+    result, written = run_checks_with(monkeypatch, measurements)
+
+    assert len(written["validity_findings"]) == 2
+    assert "outside British Columbia" in result.summary
+    assert "no geometry" in result.summary

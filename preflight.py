@@ -94,6 +94,13 @@ KNOWN_BAD_POINT_OBJECTIDS = [150984, 150985]
 # malformed and no number from it can be trusted.
 LIVE_EDIT_TOLERANCE = 5
 
+# How a feature with no geometry is found. Same clause and same reasoning as
+# checks.NULL_GEOMETRY_WHERE, repeated rather than imported because preflight
+# answers "can this environment run the pipeline" and must not depend on the
+# pipeline it is checking. Measured on both services 2026-09-08: IS NULL plus
+# IS NOT NULL comes back to the live feature count exactly on each.
+NULL_GEOMETRY_WHERE = "Shape IS NULL"
+
 logger = logging.getLogger("preflight")
 
 
@@ -378,18 +385,46 @@ def check_live_counts_and_extent(item, layer_key, grid):
         layer, grid, grid["wkid"], spatial_rel="esriSpatialRelDisjoint"
     )
 
+    # Measured separately because a feature with no geometry is counted by
+    # the layer and matched by neither spatial predicate, so it looks exactly
+    # like a filter that has lost a feature. This is where the three lines
+    # features of DESIGN.md 4.2 were found, from a one-feature discrepancy
+    # that had been reported below as "editing in progress" since the first
+    # run - which is why it is now asked directly rather than inferred.
+    null_geometry = layer.query(where=NULL_GEOMETRY_WHERE, return_count_only=True)
+    if null_geometry:
+        named = layer._con.post(f"{layer.url}/query", {
+            "f": "json", "where": NULL_GEOMETRY_WHERE,
+            "returnIdsOnly": "true", "returnGeometry": "false",
+        }).get("objectIds") or []
+        results.append(Result(
+            f"{layer_key} features with no geometry", "WARN",
+            f"{null_geometry:,} feature(s) have no geometry at all - OBJECTID "
+            f"{', '.join(str(object_id) for object_id in sorted(named)[:10])}. "
+            "No spatial check can see them. DESIGN.md section 4.2.",
+        ))
+    else:
+        results.append(Result(
+            f"{layer_key} features with no geometry", "OK", "none",
+        ))
+
     # Known-answer guard. During design a malformed geometry filter returned
     # 52,986 of 53,986 features - a plausible number that was simply wrong.
     # Intersects and disjoint must partition the layer, so their sum has to
-    # come back to the total give or take a concurrent edit.
-    drift = abs((inside + outside) - feature_count)
+    # come back to the features that HAVE a geometry, give or take a
+    # concurrent edit. Subtracting the count above rather than letting the
+    # tolerance absorb it is what keeps this able to fail on the malformed
+    # filter it was written for. DESIGN.md 7.6.2.
+    features_with_geometry = feature_count - null_geometry
+    drift = abs((inside + outside) - features_with_geometry)
     if drift > LIVE_EDIT_TOLERANCE:
         results.append(Result(
             f"{layer_key} extent sanity", "FAIL",
             f"geometry filter is not returning a partition: inside {inside:,} "
-            f"+ outside {outside:,} is {drift:,} away from the total "
-            f"{feature_count:,}. Too large to be a concurrent edit, so do "
-            "not trust either number.",
+            f"+ outside {outside:,} is {drift:,} away from the "
+            f"{features_with_geometry:,} features that have a geometry "
+            f"({feature_count:,} in the layer, {null_geometry:,} with none). "
+            "Too large to be a concurrent edit, so do not trust either number.",
         ))
     elif drift:
         results.append(Result(

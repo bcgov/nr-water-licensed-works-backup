@@ -30,7 +30,13 @@ layers:
     # Shape__Length exists on lines only, so the total-length metric
     # is collected for this layer and skipped for points.
     has_length_field: true
-    null_check_fields:
+    # Fields watched for values going missing. Renamed from
+    # null_check_fields on 2026-09-08, when the query behind it started
+    # counting blank strings as well as nulls - on these services the
+    # blank string is how a missing value is usually stored, and the old
+    # name is what made that easy to miss. See the missing_rate note in
+    # the thresholds block below.
+    missing_check_fields:
       - TWRK_TAG
       - FEATURE_CODE
     distinct_value_field: FEATURE_CODE
@@ -41,7 +47,8 @@ layers:
     name: WATER_LICENSED_WORKS_POINTS
     geometry: point
     has_length_field: false
-    null_check_fields:
+    # See the note on the lines layer above.
+    missing_check_fields:
       - TWRK_TAG
       - FEATURE_CODE
     distinct_value_field: FEATURE_CODE
@@ -296,8 +303,33 @@ checks:
 # fail_when: both  -> percent AND absolute must both be exceeded
 # fail_when: any   -> either one is enough
 #
-# null_rate.increase_percent is in percentage POINTS, not a relative
-# change. A field going from 0.1% null to 5.1% null has risen by 5.0.
+# missing_rate.increase_percent is in percentage POINTS, not a relative
+# change. A field going from 0.1% missing to 5.1% missing has risen by 5.0.
+#
+# missing_rate WAS null_rate, AND ITS BASELINE MOVED ON 2026-09-08.
+# The query behind it asked `<field> IS NULL` and nothing else, while the
+# dominant representation of a missing value on these services is the
+# empty string. Measured: points TWRK_TAG reported 9.25% against 49.99%
+# actually missing, and lines TWRK_TAG 4.89% against 39.84%. Drill
+# scenario 7 blanked 3,068 works tags with ArcGIS Pro's Calculate Field -
+# which writes an empty string - and the metric moved by zero, so the
+# rule was blind to the failed field calculation it exists to catch.
+#
+# The consequence for anyone reading the history: THE TREND COMPARISON
+# DOES NOT CROSS 2026-09-08. Every metrics file written before that date
+# carries the old meaning of missing_counts and missing_rates_percent, so
+# comparing one against a later file measures the change of definition
+# and not a change in the data. Same class of break as altering the
+# spatial grid, and it is recorded here for the same reason.
+#
+# The first run after the change was expected to jump about forty points
+# on points TWRK_TAG and trip increase_percent once. It did not, and the
+# reason is the rename: the metric this rule reads is called something
+# different from what every earlier file holds, so there was no
+# comparison to make and no violation to raise. Measured either side on
+# 2026-09-08 - points TWRK_TAG 9.2557% then 49.9880%, lines 4.8903% then
+# 39.8413%. The suppression written for it was removed the same day; see
+# the suppressions block below. DESIGN.md 7.6.3.
 #
 # There is no distinct_values rule. DESIGN.md 7.2 proposed one to catch a
 # domain violation on FEATURE_CODE, and measurement on 2026-08-14 showed
@@ -385,7 +417,7 @@ thresholds:
       # Covers field names and types, domain coded values, and subtypes.
       rule: exact_match
       severity: FAIL
-    null_rate:
+    missing_rate:
       increase_percent: 5    # PLACEHOLDER
       severity: WARN
     # No distinct_values rule - see the note above the thresholds block.
@@ -447,7 +479,7 @@ thresholds:
     schema:
       rule: exact_match
       severity: FAIL
-    null_rate:
+    missing_rate:
       increase_percent: 5    # PLACEHOLDER
       severity: WARN
     # No distinct_values rule - see the note above the thresholds block.
@@ -457,6 +489,23 @@ thresholds:
 # edit or schema update. Suppressions are logged, and both dates are
 # required so a suppression cannot be open-ended in either direction.
 # Leave empty in normal operation.
+#
+# A dated missing_rate suppression was written here for the 2026-09-08
+# re-baseline and REMOVED THE SAME DAY, because the run proved it had
+# nothing to suppress. Worth recording rather than just deleting.
+#
+# The metric was renamed with the query - null_rates_percent became
+# missing_rates_percent - so check_missing_rate looked for a field that no
+# metrics file written before that day contains, found no comparison, and
+# raised nothing. The forty-point jump on points TWRK_TAG (9.26% to 49.99%,
+# measured either side) never reached a threshold at all. The rename
+# enforces the trend break by construction, where a dated window only
+# enforces it if somebody guessed the right dates.
+#
+# The cost is the same either way and is worth being plain about: on
+# 2026-09-08 the missing_rate rule did not run on either layer. A
+# suppressed rule and a rule with nothing to compare against are both a
+# rule that is not checking that day. DESIGN.md 7.6.3.
 suppressions: []
 # Example:
 #   - rule: feature_count
@@ -552,6 +601,22 @@ notifications:
     # during the baseline period, narrow this row to [developer] and nothing
     # else has to change. Decided 2026-08-19, DESIGN.md 7.6.1.1.
     features_outside_bc: [data_owner, shared_inbox, developer]
+    # The second finding, added 2026-09-08, and ALSO NOT A ROW OF ITS OWN
+    # EMAIL - read it the same way as the row above.
+    #
+    # Three lines features had no geometry when this was found on
+    # 2026-09-01, two of them created that week, and nothing in the check
+    # set could see them: the count moves by two, the extent and the grid
+    # are unchanged by definition because a feature with no geometry is in
+    # no envelope and no cell, and the schema is untouched. Same gap as the
+    # row above in a second place (DESIGN.md 4.2, 7.6.2).
+    #
+    # Its own row rather than sharing the one above, so that either can be
+    # narrowed to [developer] without the other. Same recipients today,
+    # because it is the same kind of thing: records that cannot be right,
+    # belonging to Water Authorizations, which only the data owner can get
+    # corrected - and the message carries the OBJECTIDs so she can.
+    null_geometry: [data_owner, shared_inbox, developer]
     weekly_summary: [data_owner, shared_inbox, developer]
 
   # A SYSTEM_FAIL lasting this long means backups are not running, which

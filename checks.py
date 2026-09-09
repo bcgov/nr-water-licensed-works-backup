@@ -106,6 +106,26 @@ MAX_OBJECTIDS_NAMED = 10
 # feature code that happened to read "None".
 NULL_VALUE_LABEL = "(null)"
 
+# The polyline length field. Named here rather than in config.yml because it
+# is a property of the geometry type and not a setting anyone would tune:
+# config records whether a layer has one at all (has_length_field), and the
+# services name it this when they do.
+LENGTH_FIELD = "Shape__Length"
+
+# How a feature with no geometry is found, on both layers.
+#
+# Measured against both production services on 2026-09-08, and it earns the
+# hard-coding: `Shape IS NULL` and `Shape IS NOT NULL` come back to the live
+# feature count exactly on lines AND on points, so the clause partitions the
+# layer rather than merely returning a plausible number. DESIGN.md 7.6.2
+# proposed `Shape__Length IS NULL`, which works on lines and is rejected as an
+# invalid field on points, leaving that layer unmeasurable - this covers both.
+#
+# Not in config.yml because it is not a setting: it names how the service
+# represents an absent geometry, which is a fact about the ArcGIS REST API
+# and not something a maintainer would tune.
+NULL_GEOMETRY_WHERE = "Shape IS NULL"
+
 
 @dataclass
 class CheckResult:
@@ -279,16 +299,32 @@ def query_total_length(layer, length_field, retries=None):
     return float(result.features[0].attributes["total_length"])
 
 
-def query_null_count(layer, field_name, retries=None):
-    """How many features have no value in this field.
+def query_missing_count(layer, field_name, retries=None):
+    """How many features have no usable value in this field.
 
-    IS NULL only, which is what DESIGN.md 7.2 specifies. Worth knowing when
-    reading the number: both layers also carry blank-string values in
-    FEATURE_CODE, and those are not nulls and are not counted here.
+    NULL OR EMPTY STRING, and the second half is the one that matters. This
+    asked `IS NULL` alone until 2026-09-08, and on these services the
+    dominant representation of a missing value is the empty string: points
+    TWRK_TAG reported 9.25% null against 49.99% actually missing, and lines
+    4.89% against 39.84%. Half the points layer has no works tag and the
+    check reported nine percent.
+
+    That made the rule blind to the exact failure it exists for. DESIGN.md
+    7.2 gives it the target "failed field calculation", and Calculate Field
+    in ArcGIS Pro blanks a text field by writing an empty string - which is
+    what drill scenario 7 did, by accident, with the ordinary tool a person
+    would reach for. 3,068 records lost their works tag and this metric moved
+    by zero. DESIGN.md 7.6.3.
+
+    `= ''` and `= ' '` return identical counts on these services, so the SQL
+    layer is ignoring trailing spaces and blanks are one set rather than two.
     """
     return int(attempt_query(
-        f"null count on {field_name}",
-        lambda: layer.query(where=f"{field_name} IS NULL", return_count_only=True),
+        f"missing count on {field_name}",
+        lambda: layer.query(
+            where=f"{field_name} IS NULL OR {field_name} = ''",
+            return_count_only=True,
+        ),
         retries,
     ))
 
@@ -370,6 +406,52 @@ def count_in_envelope(layer, bounds, wkid, spatial_rel="esriSpatialRelIntersects
         },
         return_count_only=True,
     ), retries))
+
+
+def query_null_geometry_count(layer, retries=None):
+    """How many features the layer holds that have no geometry at all.
+
+    Measured in its own right rather than inferred from the grid partition,
+    which is the difference that makes the guard below still work. A feature
+    with no geometry is counted by `where=1=1` and matched by neither
+    spatial predicate, so it moves inside-plus-outside away from the layer
+    total by exactly one - indistinguishable, from the drift alone, from a
+    malformed geometry filter. Subtracting a separately measured number keeps
+    the guard able to fail loudly on the second while accounting for the
+    first. DESIGN.md 7.6.2.
+    """
+    return int(attempt_query(
+        "null geometry count",
+        lambda: layer.query(where=NULL_GEOMETRY_WHERE, return_count_only=True),
+        retries,
+    ))
+
+
+def query_null_geometry_objectids(layer, retries=None):
+    """Which features have no geometry, by OBJECTID.
+
+    Raw REST for the same reason the disjoint identifiers are: returnIdsOnly
+    is not subject to maxRecordCount, the response shape is checked rather
+    than assumed, and the caller compares the number of identifiers against
+    the count it already has. An alert saying "3 features have no geometry"
+    is worth much less to whoever would correct them than one saying which.
+    """
+    response = attempt_query("objectids with null geometry", lambda: layer._con.post(
+        f"{layer.url}/query",
+        {
+            "f": "json",
+            "where": NULL_GEOMETRY_WHERE,
+            "returnIdsOnly": "true",
+            "returnGeometry": "false",
+        },
+    ), retries)
+    if "objectIds" not in response:
+        raise RuntimeError(
+            f"The null geometry query on {layer.url} returned no objectIds "
+            f"field, so the features with no geometry could not be named. No "
+            f"metrics file has been written."
+        )
+    return sorted(int(object_id) for object_id in response["objectIds"] or [])
 
 
 def query_objectids_outside_envelope(layer, bounds, wkid, retries=None):
@@ -480,7 +562,7 @@ def query_spatial_bins(layer, grid, layer_key, retries=None):
 
 
 def assert_grid_partitions_layer(layer, layer_key, spatial_bins, feature_count, grid,
-                                 retries=None):
+                                 null_geometry_count=0, retries=None):
     """The known-answer guard, run on every pass before anything is recorded.
 
     This is what makes the grid numbers trustworthy, and DESIGN.md 7.2.2
@@ -499,6 +581,23 @@ def assert_grid_partitions_layer(layer, layer_key, spatial_bins, feature_count, 
     by a completely different route from the extent query - on points it is
     the two known bad records of DESIGN.md 4, every time.
 
+    THE FEATURES COMPARED AGAINST ARE THE ONES THAT HAVE A GEOMETRY, which
+    is the whole of the change made on 2026-09-08. A feature with no geometry
+    is counted by the layer and matched by neither spatial predicate, so each
+    one moved this sum by exactly one and the difference was absorbed by
+    LIVE_EDIT_TOLERANCE - a tolerance written to allow for edits landing
+    between two queries, which had quietly acquired a second job nobody
+    decided on. At six such features it stopped absorbing and the run raised,
+    reporting SYSTEM_FAIL and writing no metrics at all, with a message that
+    sent the reader to the query code when the fault was in the data. Lines
+    stood at three on 2026-09-01. DESIGN.md 7.6.2.
+
+    Subtracted from a separately measured count rather than covered by a
+    wider tolerance, deliberately. This guard has caught three well-formed
+    wrong answers already (DESIGN.md 12) and its whole value is that it fails
+    loudly on a malformed filter. Widening it to swallow a data defect would
+    widen it to swallow those too.
+
     Returns the envelope total and the number of features outside the grid,
     both recorded as metrics in their own right.
     """
@@ -508,14 +607,20 @@ def assert_grid_partitions_layer(layer, layer_key, spatial_bins, feature_count, 
         layer, grid, grid["wkid"], spatial_rel="esriSpatialRelDisjoint", retries=retries
     )
 
-    partition_drift = abs((inside + outside) - feature_count)
+    features_with_geometry = feature_count - null_geometry_count
+    partition_drift = abs((inside + outside) - features_with_geometry)
     if partition_drift > LIVE_EDIT_TOLERANCE:
+        # The null geometry count is named in the message because it is part
+        # of the arithmetic the reader is being asked to trust, and because
+        # its absence is what used to send them to the wrong place.
         raise RuntimeError(
             f"The {layer_key} geometry filter is not returning a partition: "
             f"inside the grid {inside:,} plus outside {outside:,} is "
-            f"{partition_drift:,} away from the layer total {feature_count:,}. "
-            f"Too large to be a concurrent edit, so no spatial number from "
-            f"this run can be trusted. No metrics file has been written."
+            f"{partition_drift:,} away from the {features_with_geometry:,} "
+            f"features that have a geometry ({feature_count:,} in the layer, "
+            f"{null_geometry_count:,} with none). Too large to be a concurrent "
+            f"edit, so no spatial number from this run can be trusted. No "
+            f"metrics file has been written."
         )
 
     if not inside:
@@ -557,31 +662,35 @@ def assert_grid_partitions_layer(layer, layer_key, spatial_bins, feature_count, 
 # ---------------------------------------------------------------------------
 
 
-def checked_outlier_objectids(layer_key, object_ids, outside):
-    """The identifiers to record for the features outside the grid envelope.
+def checked_objectids(layer_key, object_ids, expected, what):
+    """The identifiers to record for a set of features already counted.
 
-    A known-answer guard, and it is here rather than inside the query above
+    A known-answer guard, and it is here rather than inside the queries above
     because it is arithmetic and not transport - which also makes it testable
     against hand-written values, where anything issuing a query is not.
 
-    The identifiers and the count come from two different queries: this list,
-    and inside-plus-outside against the layer total. Two measurements of the
-    same thing that disagree mean one of them is wrong, and a plausible wrong
-    number is the failure this project has hit three times (DESIGN.md 12), so
-    the run stops rather than naming records that may not be the offending
-    ones. The tolerance is the usual one - these layers are edited while the
-    check is running and the two queries are moments apart.
+    The identifiers and the count always come from two different queries. Two
+    measurements of the same thing that disagree mean one of them is wrong,
+    and a plausible wrong number is the failure this project has hit three
+    times (DESIGN.md 12), so the run stops rather than naming records that
+    may not be the offending ones. The tolerance is the usual one - these
+    layers are edited while the check is running and the two queries are
+    moments apart.
 
-    Only as many as an alert will name are kept. The count is the metric; this
-    is the part a person acts on, and a metrics file is not the place to
+    Only as many as an alert will name are kept. The count is the metric;
+    this is the part a person acts on, and a metrics file is not the place to
     accumulate an unbounded list.
+
+    Used for the features outside the grid envelope and, since 2026-09-08,
+    for the features with no geometry. One guard rather than two, so that the
+    second condition cannot be given a weaker one by accident.
     """
-    if abs(len(object_ids) - outside) > LIVE_EDIT_TOLERANCE:
+    if abs(len(object_ids) - expected) > LIVE_EDIT_TOLERANCE:
         raise RuntimeError(
-            f"The {layer_key} disjoint query counted {outside:,} features "
-            f"outside the grid envelope but named {len(object_ids):,} of them. "
-            f"Too large a gap to be editing during the run, so one of the two "
-            f"queries is wrong. No metrics file has been written."
+            f"The {layer_key} run counted {expected:,} features {what} but "
+            f"named {len(object_ids):,} of them. Too large a gap to be editing "
+            f"during the run, so one of the two queries is wrong. No metrics "
+            f"file has been written."
         )
     return object_ids[:MAX_OBJECTIDS_NAMED]
 
@@ -630,16 +739,57 @@ def collect_layer_metrics(gis, layer_key, layer_config, config):
         datetime.datetime.fromtimestamp(last_edit / 1000, datetime.timezone.utc)
     ) if last_edit else None
 
+    # Every per-field query below asks about a field the layer actually has,
+    # rather than about a name in config.yml.
+    #
+    # Deleting a field used to abort the whole collection. The service
+    # rejects `<field> IS NULL` on a field that is gone, the exception left
+    # the run reporting SYSTEM_FAIL, and the schema fingerprint taken a few
+    # lines above - which names the missing field exactly - was thrown away
+    # with every other measurement. So a schema change was reported to the
+    # developer instead of to the data owner, recorded nothing, and repeated
+    # every day until somebody noticed.
+    #
+    # It also failed open, which is the half with a consequence. Phase 2's
+    # staging script aborts on DATA_FAIL only, because a transient API error
+    # must not halt the nightly push - so a dropped field misclassified as
+    # SYSTEM_FAIL would let that push proceed with the check blind, which is
+    # the one thing "fail open on system" was written to be safe about.
+    #
+    # An absent field is a known, nameable state and not an untrustworthy
+    # measurement, so nothing is guarded here: it is recorded and left to the
+    # schema rule, which reports it as the schema change it is and names it.
+    # DESIGN.md 7.6.5.
+    layer_fields = {field["name"] for field in metrics["schema_fingerprint"]["fields"]}
+    configured_fields = list(layer_config["missing_check_fields"])
+    configured_fields.append(layer_config["distinct_value_field"])
     if layer_config["has_length_field"]:
-        metrics["total_length"] = query_total_length(layer, "Shape__Length", retries)
+        configured_fields.append(LENGTH_FIELD)
+    metrics["absent_fields"] = sorted(
+        set(name for name in configured_fields if name not in layer_fields)
+    )
+    if metrics["absent_fields"]:
+        logger.warning(
+            "%s: %s named in config.yml but not on the layer - not queried, "
+            "and left to the schema rule to report",
+            layer_key, ", ".join(metrics["absent_fields"]),
+        )
 
-    metrics["null_counts"] = {
-        field_name: query_null_count(layer, field_name, retries)
-        for field_name in layer_config["null_check_fields"]
+    if layer_config["has_length_field"] and LENGTH_FIELD in layer_fields:
+        metrics["total_length"] = query_total_length(layer, LENGTH_FIELD, retries)
+
+    # Named for what they measure - a value that is missing, by null or by
+    # blank string - rather than for the SQL that used to be issued. The
+    # names moved with the query on 2026-09-08, because a metric called
+    # null_counts that counts blanks is how this went unnoticed for a month.
+    metrics["missing_counts"] = {
+        field_name: query_missing_count(layer, field_name, retries)
+        for field_name in layer_config["missing_check_fields"]
+        if field_name in layer_fields
     }
-    metrics["null_rates_percent"] = {
+    metrics["missing_rates_percent"] = {
         field_name: round(100.0 * count / feature_count, 4)
-        for field_name, count in metrics["null_counts"].items()
+        for field_name, count in metrics["missing_counts"].items()
     }
 
     # Measured every run and ruled on by nothing. DESIGN.md 7.2 proposed a
@@ -664,7 +814,14 @@ def collect_layer_metrics(gis, layer_key, layer_config, config):
     # without re-collecting anything.
     distinct_field = layer_config["distinct_value_field"]
     metrics["distinct_value_field"] = distinct_field
-    metrics["value_counts"] = query_value_counts(layer, distinct_field, feature_count, retries)
+    # Empty rather than absent when the field has been dropped, so that the
+    # shape of a metrics file does not change with the schema. A field that
+    # does not exist carries no values, which is what this then says.
+    metrics["value_counts"] = {}
+    if distinct_field in layer_fields:
+        metrics["value_counts"] = query_value_counts(
+            layer, distinct_field, feature_count, retries
+        )
 
     domain_codes = (
         metrics["schema_fingerprint"]["domains"].get(distinct_field, {}).get("coded_values", [])
@@ -675,9 +832,31 @@ def collect_layer_metrics(gis, layer_key, layer_config, config):
         if value not in domain_codes and value != NULL_VALUE_LABEL
     )
 
+    # Before the grid, because the guard below needs it: a feature with no
+    # geometry is counted by the layer and lands in no cell and on neither
+    # side of the partition. Reported as a finding rather than ruled on -
+    # three records nobody disputes must not block every monthly promotion,
+    # which is the argument at DESIGN.md 7.6.1 applied unchanged. 7.6.2.
+    null_geometry = query_null_geometry_count(layer, retries)
+    metrics["features_with_null_geometry"] = null_geometry
+    metrics["objectids_with_null_geometry"] = []
+    if null_geometry:
+        metrics["objectids_with_null_geometry"] = checked_objectids(
+            layer_key,
+            query_null_geometry_objectids(layer, retries),
+            null_geometry,
+            "with no geometry",
+        )
+        logger.warning(
+            "%s: %s feature(s) have no geometry - OBJECTID %s",
+            layer_key, f"{null_geometry:,}",
+            ", ".join(str(oid) for oid in metrics["objectids_with_null_geometry"]),
+        )
+
     metrics["spatial_bins"] = query_spatial_bins(layer, grid, layer_key, retries)
     inside, outside = assert_grid_partitions_layer(
-        layer, layer_key, metrics["spatial_bins"], feature_count, grid, retries
+        layer, layer_key, metrics["spatial_bins"], feature_count, grid,
+        null_geometry, retries,
     )
     metrics["spatial_bins_populated"] = len(metrics["spatial_bins"])
     metrics["features_inside_grid"] = inside
@@ -688,10 +867,11 @@ def collect_layer_metrics(gis, layer_key, layer_config, config):
     # a query that returns nothing is not worth issuing 364 days a year.
     metrics["objectids_outside_grid"] = []
     if outside:
-        metrics["objectids_outside_grid"] = checked_outlier_objectids(
+        metrics["objectids_outside_grid"] = checked_objectids(
             layer_key,
             query_objectids_outside_envelope(layer, grid, grid["wkid"], retries),
             outside,
+            "outside the grid envelope",
         )
         logger.warning(
             "%s: %s feature(s) fall outside the grid envelope entirely - "
@@ -1126,17 +1306,23 @@ def check_schema(layer_key, current, reference, thresholds):
     )]
 
 
-def check_null_rate(layer_key, current, reference, thresholds):
-    """Null rate per field, in percentage points.
+def check_missing_rate(layer_key, current, reference, thresholds):
+    """Missing-value rate per field, in percentage points.
 
     Points rather than a relative change on purpose: a field going from 0.1%
-    null to 5.1% null is a failed field calculation worth waking up for,
-    while the same move expressed relatively is a 5,000% increase that tells
-    the reader nothing about how much data is affected.
+    missing to 5.1% missing is a failed field calculation worth waking up
+    for, while the same move expressed relatively is a 5,000% increase that
+    tells the reader nothing about how much data is affected.
+
+    Called null_rate until 2026-09-08, when the query behind it started
+    counting blank strings as well as nulls (DESIGN.md 7.6.3). The rule was
+    renamed with the metric rather than left: a rule named for nulls that
+    fires on blanks is the same mistake in a second place, and the name is
+    what a reader sees in an alert and in the notifier's dedup value.
     """
-    rule = thresholds.get("null_rate")
-    current_rates = current.get("null_rates_percent")
-    previous_rates = reference.get("null_rates_percent")
+    rule = thresholds.get("missing_rate")
+    current_rates = current.get("missing_rates_percent")
+    previous_rates = reference.get("missing_rates_percent")
     if not rule or not current_rates or not previous_rates:
         return []
 
@@ -1148,7 +1334,7 @@ def check_null_rate(layer_key, current, reference, thresholds):
         increase = current_rate - previous_rate
         if increase > rule["increase_percent"]:
             violations.append(Violation(
-                layer_key, "null_rate", rule["severity"], "daily",
+                layer_key, "missing_rate", rule["severity"], "daily",
                 f"The share of {layer_key} features with no {field_name} rose "
                 f"from {previous_rate:.2f}% to {current_rate:.2f}%, an increase "
                 f"of {increase:.2f} percentage points.",
@@ -1185,7 +1371,7 @@ def evaluate_layer(layer_key, current, previous, trend, anchor, thresholds):
             layer_key, current, previous, thresholds, "previous check"))
         violations.extend(check_spatial_bins(layer_key, current, previous, thresholds))
         violations.extend(check_schema(layer_key, current, previous, thresholds))
-        violations.extend(check_null_rate(layer_key, current, previous, thresholds))
+        violations.extend(check_missing_rate(layer_key, current, previous, thresholds))
 
     if trend:
         violations.extend(check_feature_count(
@@ -1275,6 +1461,44 @@ def outside_bc_finding(layer_key, current):
     return (
         f"{layer_key}: {outside:,} {subject} outside British Columbia ({which})."
     )
+
+
+def null_geometry_finding(layer_key, current):
+    """The features that have no geometry, as one line, or None.
+
+    The second validity finding, written 2026-09-08 for the same reason as
+    the first: DESIGN.md 4.2 found three lines features with no geometry at
+    all, two of them created the week they were found, and not one rule in
+    the set could see them. The count moves by two, far under any threshold;
+    extent and the grid are unchanged by definition, because a feature with
+    no geometry is in no envelope and no cell; total length moves by nothing;
+    the schema is unchanged; and missing_rate watches attributes rather than
+    the shape. Every rule asks whether the data moved. None asks whether it
+    can be right.
+
+    A finding and never a rule, for the reason in the section comment above:
+    three records nobody disputes would otherwise hold the status permanently
+    off PASS and block every monthly promotion for as long as they went
+    uncorrected. They belong to Water Authorizations to correct.
+
+    Same shape as the line above - layer and count first, identifiers in
+    brackets - because jenkins/notify.py parses both the same way.
+    """
+    count = current.get("features_with_null_geometry")
+    if not count:
+        return None
+
+    object_ids = current.get("objectids_with_null_geometry") or []
+    named = ", ".join(str(object_id) for object_id in object_ids)
+    if not named:
+        which = "this run could not name them"
+    elif count > len(object_ids):
+        which = f"OBJECTID {named} - the first {len(object_ids)} of {count:,}"
+    else:
+        which = f"OBJECTID {named}"
+
+    subject = "feature has" if count == 1 else "features have"
+    return f"{layer_key}: {count:,} {subject} no geometry ({which})."
 
 
 # ---------------------------------------------------------------------------
@@ -1576,10 +1800,11 @@ def run_checks(config):
     # outside_bc_finding.
     findings = []
     for layer_key, current in measurements.items():
-        finding = outside_bc_finding(layer_key, current)
-        if finding:
-            logger.warning("%s", finding)
-            findings.append(finding)
+        for finding in (outside_bc_finding(layer_key, current),
+                        null_geometry_finding(layer_key, current)):
+            if finding:
+                logger.warning("%s", finding)
+                findings.append(finding)
 
     status = status_from(violations, has_comparison=previous is not None)
     details.extend(violation.message for violation in violations)

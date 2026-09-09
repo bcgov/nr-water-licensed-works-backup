@@ -64,7 +64,7 @@ flowchart TD
 
 File geodatabase is used because it preserves field types, nulls, coded-value domains and subtypes. It does not capture hosted service configuration — item ID, sharing, symbology, sync settings — which is why the documented restore path preserves the existing hosted item rather than replacing it.
 
-**Checks** run daily. They collect dataset-level metrics from live queries — feature count, extent, spatial bin distribution over a fixed 50 km grid, total length, schema fingerprint, null rates, distinct coded values — and compare each against the previous run, a rolling 30-day median, and the most recent monthly baseline. The result is one of `PASS`, `BASELINE`, `WARN`, `DATA_FAIL` or `SYSTEM_FAIL`.
+**Checks** run daily. They collect dataset-level metrics from live queries — feature count, extent, spatial bin distribution over a fixed 50 km grid, total length, schema fingerprint, missing-value rates, distinct coded values — and compare each against the previous run, a rolling 30-day median, and the most recent monthly baseline. The result is one of `PASS`, `BASELINE`, `WARN`, `DATA_FAIL` or `SYSTEM_FAIL`.
 
 Every one of those rules asks whether something *changed*. A separate class of finding asks whether the data can be right at all — a feature whose coordinates place it outside British Columbia is wrong on the first run and on the four hundredth, and no comparison will ever show it. Findings are reported in the run's details and never in its status, so a known-bad record raises an alert without blocking anything for as long as it goes uncorrected.
 
