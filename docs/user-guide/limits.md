@@ -6,13 +6,10 @@ nav_order: 4
 
 # What this does not cover
 
-Stated plainly, because a limit you know about is worth more than one you
-find later.
-
-**This detects; it does not prevent.** A bad edit reaching the province's
-central database is not stopped by any of this. It is made visible within a
-day and recoverable from a backup, which is a different and smaller claim
-than prevention.
+**This detects; it does not prevent.** A bad edit reaching the BC
+Geographic Warehouse (BCGW) is not stopped by any of this. It is made
+visible within a day and recoverable from a backup, which is a different
+and smaller claim than prevention.
 
 **A restore has a lag as well as a cost.** The downstream copy of the data
 is corrected on its own next scheduled update, not the instant a restore
@@ -43,9 +40,9 @@ added later.
 ## What can only be confirmed by hand
 
 Three things can only be confirmed by actually looking, after a real
-restore: that the everyday editing application still opens and saves
-normally, that the nightly push to the central database still runs
-cleanly, and that direct editing still works as expected. The restore
+restore: that QuickWins still opens and saves normally, that the nightly
+push to BCGW still runs cleanly, and that direct editing still works as
+expected. The restore
 process keeps a layer's identity — its web address, sharing, and styling —
 exactly as it was, so there's no obvious way any of those three would
 break. But confirming is a short check, and it costs nothing to do.

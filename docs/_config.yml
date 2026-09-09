@@ -1,6 +1,10 @@
 # Jekyll configuration for the Water Licensed Works Backup documentation site.
 # Published via GitHub Pages from the /docs folder on the main branch.
-title: Water Licensed Works — Backup and Integrity Checks
+# Short on purpose: just-the-docs renders this in a fixed-height sidebar
+# header, and the full name ("... — Backup and Integrity Checks") wraps to
+# three lines and clips at the top. The full name is the Home page's H1
+# instead, where the width isn't constrained.
+title: Water Licensed Works Backup
 description: >-
   Documentation for the scheduled backups and daily integrity checks that
   protect the Water Licensed Works lines and points layers in ArcGIS Online.

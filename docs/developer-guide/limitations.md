@@ -43,9 +43,9 @@ kinds of change do not trip any of them:
 Three things can only be confirmed against a real production restore, and
 are out of scope here:
 
-- That the everyday editing application opens and edits normally
+- That QuickWins opens and edits normally afterward.
+- That the nightly push to the BC Geographic Warehouse (BCGW) runs cleanly
   afterward.
-- That the nightly push to the central database runs cleanly afterward.
 - That direct editing in desktop GIS tools is unaffected.
 
 The residual risk is judged low: the restore path never changes a layer's

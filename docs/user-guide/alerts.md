@@ -6,9 +6,8 @@ nav_order: 1
 
 # What arrives in your inbox
 
-**The proposal, already in effect: everything below goes to you and to the
-shared inbox together.** Two addresses, one audience, so a message can
-reach one and not the other only by mistake, not by design.
+**Everything below goes to the data owner and to the Water Business shared
+inbox.**
 
 ## What reaches you
 

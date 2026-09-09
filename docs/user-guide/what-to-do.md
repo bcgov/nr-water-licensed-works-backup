@@ -24,8 +24,8 @@ faster than a restore and keeps everything else intact. See
 [Requesting a restore]({{ site.baseurl }}{% link user-guide/requesting-a-restore.md %})
 if a restore does look like the right call.
 
-**Who else knows.** The shared inbox and the maintainer received the same
-message.
+**Who else knows.** The Water Business shared inbox and the maintainer
+received the same message.
 
 ![Example data-problem alert, showing the job, result, and what happened]({{ site.baseurl }}/assets/img/alert-data-problem.png)
 
@@ -42,7 +42,7 @@ thinning out.
 warning that keeps recurring can be raised as a real problem rather than
 noticed only in hindsight.
 
-**Who else knows.** The shared inbox and the maintainer.
+**Who else knows.** The Water Business shared inbox and the maintainer.
 
 ## A record that cannot be right
 
@@ -61,8 +61,8 @@ message you receive always has the current one.
 typically long-standing data issues rather than something that just broke.
 Correcting them removes them from every future message.
 
-**Who else knows.** The shared inbox and the maintainer, on whichever
-message happens to carry the finding.
+**Who else knows.** The Water Business shared inbox and the maintainer, on
+whichever message happens to carry the finding.
 
 ## A weekly summary
 
@@ -74,5 +74,4 @@ It exists so that silence isn't the only sign the system is working.
 ## If you're not sure
 
 If a message names a check you don't recognise, or you're unsure whether
-something needs a response, contact the maintainer — that's a faster answer
-than guessing.
+something needs a response, contact the maintainer.

@@ -8,9 +8,7 @@ has_children: true
 
 For whoever runs, fixes, or extends this pipeline.
 
-The people who maintain this repository are GIS professionals who know
-Python, ArcGIS, and spatial data — not necessarily software developers. The
-code is written to be read top to bottom in a single file, without
+The code is written to be read top to bottom in a single file, without
 following abstractions across a dozen others: functions rather than
 classes, flat modules, and no magic numbers — every tunable value lives in
 `config.yml`, with the reasoning for it in a comment beside the value.

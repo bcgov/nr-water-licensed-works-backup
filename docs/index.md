@@ -6,8 +6,9 @@ nav_order: 1
 # Water Licensed Works — Backup and Integrity Checks
 
 The `WATER_LICENSED_WORKS_LINES` and `WATER_LICENSED_WORKS_POINTS` layers in
-ArcGIS Online are edited every day through a web application and by a number
-of direct editors, then pushed nightly into a provincial staging database.
+ArcGIS Online are edited every day through a web application (QuickWins) and
+by a number of direct editors, then pushed nightly into the BC Geographic
+Warehouse (BCGW).
 Before this project, neither layer had a backup, and nothing checked what the
 nightly push carried downstream — a bad bulk edit was both undetectable and
 unrecoverable.

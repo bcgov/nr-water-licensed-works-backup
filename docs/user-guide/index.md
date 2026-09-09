@@ -8,21 +8,20 @@ has_children: true
 
 For the data owner and the GIS team. No technical background is needed.
 
-You and the shared inbox receive the same messages from this system, by
-design — so that a message can never reach one of you and not the other.
-This guide is written for both.
+You and the Water Business shared inbox receive the same messages from this
+system. This guide is written for both.
 
 ## What this protects
 
 Two datasets: a **layer** of lines and a **layer** of points, both recording
 licensed water works. Both are edited constantly through a web application
-and by GIS staff working directly in the data.
+(QuickWins) and by GIS staff working directly in the data.
 
 The lines and points are copied — **backed up** — three times a week, and
 measured every evening. Before this existed, neither layer had a backup, and
-nothing checked what the nightly push into the province's central database
-carried downstream. A large mistaken edit would have gone unnoticed and
-could not have been undone.
+nothing checked what the nightly push into the BC Geographic Warehouse
+(BCGW) carried downstream. A large mistaken edit would have gone unnoticed
+and could not have been undone.
 
 ## What is checked
 
