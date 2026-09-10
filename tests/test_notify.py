@@ -1341,7 +1341,7 @@ def test_the_state_round_trips():
 def test_the_state_survives_the_job_moving_between_agents(sent):
     """The reason it is in the bucket at all. Two consecutive polls that share
     nothing but the bucket must still deduplicate - which is what a Jenkins job
-    on 'agent any' actually does."""
+    free to run on more than one agent actually does."""
     entries = [run("checks", at(19, 2, 6), "DATA_FAIL", "Points feature count fell 14%.")]
     written = {}
 

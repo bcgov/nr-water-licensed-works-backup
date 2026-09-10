@@ -19,17 +19,35 @@
 // tests/test_notify.py rather than a permission boundary.
 
 pipeline {
-    // No agent label, and that is deliberate rather than unconsidered: a poll
-    // needs no particular capability - no arcpy, no geodatabase, no large
-    // workspace - only network reach and the interpreter named below.
+    // Pinned to algorab or schedar since 2026-09-10. It was `agent any` until
+    // then, on the reasoning that a poll needs no particular capability - no
+    // arcpy, no geodatabase, no large workspace - only network reach and the
+    // interpreter named below. In practice every build landed on zavijava_rfc,
+    // which no other job on this instance uses, and from 04:45 that morning it
+    // could no longer reach the network share the interpreter lives on, while
+    // the share itself was fine. Most other jobs run on algorab and schedar.
     //
-    // The consequence worth remembering: THIS JOB CAN RUN ON A DIFFERENT
-    // MACHINE EVERY HOUR. Nothing it needs between polls may live on an
-    // agent's disk, which is why its deduplication state is kept in object
-    // storage. A state file would be silently wrong the first time the
-    // scheduler picked a different machine, and the symptom would be an email
-    // every hour - the one failure this job is written to avoid.
-    agent any
+    // THESE ARE NODE NAMES, AND A NAME THAT MATCHES NOTHING IS SILENT. Jenkins
+    // lets an agent's name be used as a label, but a label no agent carries is
+    // not an error: the build waits in the queue for an agent that never
+    // comes. The timeout below does not start until an agent has been found -
+    // the build log shows it opening inside the node - so nothing ends that
+    // wait, and the post { failure } handler never runs. If this job goes
+    // quiet after a change to this line, look at the build queue before
+    // believing it is healthy.
+    //
+    // Everything this job needs from an agent - the interpreter path, reach
+    // to github.com past the proxy, object storage, the relay - was proven on
+    // zavijava_rfc and nowhere else. The first build on each of these two is
+    // the proof for that machine.
+    //
+    // Still two machines, so the consequence worth remembering holds: THIS
+    // JOB CAN RUN ON A DIFFERENT MACHINE EVERY HOUR. Nothing it needs between
+    // polls may live on an agent's disk, which is why its deduplication state
+    // is kept in object storage. A state file would be silently wrong the
+    // first time the scheduler picked the other machine, and the symptom would
+    // be an email every hour - the one failure this job is written to avoid.
+    agent { label 'algorab || schedar' }
 
     options {
         // Hourly polling fills a build list quickly. Fifty builds is a little
