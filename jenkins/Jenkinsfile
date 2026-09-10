@@ -36,10 +36,12 @@ pipeline {
     // quiet after a change to this line, look at the build queue before
     // believing it is healthy.
     //
-    // Everything this job needs from an agent - the interpreter path, reach
-    // to github.com past the proxy, object storage, the relay - was proven on
-    // zavijava_rfc and nowhere else. The first build on each of these two is
-    // the proof for that machine.
+    // Everything this job needed from an agent - the interpreter path, git and
+    // reach to github.com past the proxy, object storage, the relay - was
+    // proven on zavijava_rfc and nowhere else. The first build on algorab
+    // settled two of them: the interpreter and its packages work there, and
+    // git is not installed at all, which is why CODE_SOURCE below defaults to
+    // object_storage. schedar has proven nothing yet.
     //
     // Still two machines, so the consequence worth remembering holds: THIS
     // JOB CAN RUN ON A DIFFERENT MACHINE EVERY HOUR. Nothing it needs between
@@ -109,54 +111,52 @@ pipeline {
             description: 'Report what would be sent and send nothing. Writes no state, so it cannot suppress a later real alert.'
         )
 
-        // Where notify.py and config.yml come from. Both routes work and
-        // both are kept; this chooses which one a build uses.
+        // Where notify.py and config.yml come from. Both routes are kept; this
+        // chooses which one a build uses.
         //
-        // 'git' checks the repository out on the agent. It is the default
-        // since 2026-08-24 for one reason above the others: A CHECKOUT OF main
-        // CANNOT BE STALE. The other route depends on a GitHub Actions
-        // workflow having published, and if that workflow ever stops firing -
-        // an edited paths filter, an expired secret - the bucket keeps serving
-        // old code and every build stays green while doing it. A notifier
-        // quietly running last month's routing table is the failure this
-        // project least wants, and it is the one failure a checkout cannot
-        // have. It also means the Jenkinsfile and the code it runs come from
-        // the same commit, which the other route cannot promise.
+        // 'object_storage' is the default again since 2026-09-10, as it was
+        // until 2026-08-24. A GitHub Actions workflow publishes both files and
+        // a checksum manifest under code/ on every push to main, and the fetch
+        // stage downloads and verifies them. It asks nothing of the agent but
+        // the interpreter and reach to the object storage endpoint - and that
+        // turned out to matter. When the job moved off zavijava_rfc onto
+        // algorab, the checkout failed because algorab has no git at all:
         //
-        // This is the step the first build failed at, and it failed at the NRS
-        // forward proxy Jenkins hands every agent rather than at github.com:
+        //     Cannot run program "git.exe" ... The system cannot find the
+        //     file specified
+        //
+        // THE COST, AND IT IS WHY git WAS THE DEFAULT IN BETWEEN: this route
+        // can be stale. If the publish workflow ever stops firing - an edited
+        // paths filter, an expired secret - the bucket keeps serving old code
+        // and every build stays green while doing it. A notifier quietly
+        // running last month's routing table is the failure this project
+        // least wants. The fetch stage prints the commit the code was
+        // published from on every build, and that line is the one to compare
+        // against main. On the day of the switch the published notify.py and
+        // config.yml were byte for byte those on main.
+        //
+        // 'git' checks the repository out on the agent, and a checkout of main
+        // cannot be stale. It needs git installed on the agent, and no_proxy
+        // below to get past the NRS forward proxy Jenkins hands every agent:
         //
         //     Failed to connect to forwardproxy.nrs.bcgov port 23128: Timed out
         //
-        // no_proxy below is what makes it work, and a successful build still
-        // logs "Setting http proxy: forwardproxy.nrs.bcgov:23128" immediately
-        // before the fetch - the proxy is still configured, git just goes past
-        // it. Proven on zavijava_rfc, the agent that produced that failure.
+        // Proven on zavijava_rfc only. Worth making the default again if git
+        // is ever installed on algorab and schedar.
         //
-        // 'object_storage' is the fallback and was the default until
-        // 2026-08-24. A GitHub Actions workflow publishes both files and a
-        // checksum manifest under code/ on every push to main, and the fetch
-        // stage downloads and verifies them. It asks nothing of the agent but
-        // reach to the object storage endpoint, which is the sanctioned route
-        // on these servers - so it is what to switch to if direct egress to
-        // github.com is ever closed off, or if the checkout breaks for any
-        // other reason.
-        //
-        // THAT PUBLISH WORKFLOW MUST KEEP RUNNING even though the default no
-        // longer uses it. A fallback nobody has published to in six months is
-        // not a fallback.
+        // THAT PUBLISH WORKFLOW MUST KEEP RUNNING. It is what every scheduled
+        // build runs.
         choice(
             name: 'CODE_SOURCE',
-            choices: ['git', 'object_storage'],
-            description: 'Where to get notify.py and config.yml. Switch to object_storage if the checkout stops working.'
+            choices: ['object_storage', 'git'],
+            description: 'Where to get notify.py and config.yml. git needs git installed on the agent, and algorab has none.'
         )
 
         // Git reads no_proxy from the environment and connects direct to
         // whatever it names, so this is what lets the checkout bypass a proxy
-        // the agent cannot reach. WITH CODE_SOURCE DEFAULTING TO git, THIS IS
-        // LOAD-BEARING ON EVERY SCHEDULED BUILD - a timer-triggered build of a
-        // parameterised job takes the defaults declared here, so this default
-        // is what the hourly poll runs on.
+        // the agent cannot reach. It is used only when CODE_SOURCE is git,
+        // which since 2026-09-10 is a manual choice rather than the default -
+        // but keep it declared, for the reasons below.
         //
         // A PARAMETER RATHER THAN AN environment{} ENTRY, ON PURPOSE. Jenkins
         // puts build parameters into the environment before the build starts,
@@ -333,10 +333,10 @@ pipeline {
             when { expression { params.CODE_SOURCE != 'git' } }
 
             steps {
-                // THE FALLBACK ROUTE since 2026-08-24, and the default before
-                // it. Everything below is unchanged from when it was the only
-                // way the code could arrive; what changed is which value of
-                // CODE_SOURCE selects it.
+                // THE DEFAULT ROUTE again since 2026-09-10, as it was until
+                // 2026-08-24; git was the default in between, and algorab has
+                // no git. Everything below is unchanged from when it was the
+                // only way the code could arrive.
                 //
                 // The bucket and prefix are written out here rather than read
                 // from config.yml, because this is the step that fetches
@@ -423,7 +423,9 @@ if __name__ == "__main__":
             when { expression { params.CODE_SOURCE == 'git' } }
 
             steps {
-                // THE DEFAULT ROUTE since 2026-08-24. It puts notify.py and
+                // THE DEFAULT ROUTE from 2026-08-24 to 2026-09-10, and a
+                // manual choice since: algorab, where the job now runs, has no
+                // git. It puts notify.py and
                 // config.yml in exactly the places the fetch stage would have
                 // put them, so the poll stage that follows neither knows nor
                 // cares which one ran, and the git plugin logs the revision it
@@ -431,7 +433,8 @@ if __name__ == "__main__":
                 // line gives the other route, so every build still says which
                 // code produced its behaviour.
                 //
-                // WHY THIS ONE IS THE DEFAULT, given the other works too: a
+                // WHY IT WAS THE DEFAULT, and is worth going back to if git is
+                // ever installed on these agents: a
                 // checkout of main cannot be stale. The other route depends on
                 // a GitHub Actions workflow having published, and if that
                 // workflow ever stops firing the bucket keeps serving old code
@@ -448,9 +451,14 @@ if __name__ == "__main__":
                 // and git ignored it for github.com. Proven on zavijava_rfc,
                 // the agent that produced the original failure.
                 //
-                // Three failures to tell apart if it ever stops working. IN
-                // ALL THREE THE FIX IS THE SAME AND TAKES ONE FIELD: set
-                // CODE_SOURCE to object_storage and the job carries on.
+                // Four failures to tell apart if it is chosen and does not
+                // work. IN ALL FOUR THE FIX IS THE SAME AND TAKES ONE FIELD:
+                // set CODE_SOURCE to object_storage and the job carries on.
+                //
+                //   Cannot run program "git.exe" ... cannot find the file
+                //       git is not installed on the agent, or not on its
+                //       PATH. Seen on algorab on 2026-09-10, and the reason
+                //       this is no longer the default.
                 //
                 //   "Failed to connect to forwardproxy.nrs.bcgov port 23128"
                 //       no_proxy is not reaching git. Check the job still
