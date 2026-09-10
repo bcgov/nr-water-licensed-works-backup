@@ -274,6 +274,15 @@ pipeline {
         // traceback about downloading rather than with the sentence below.
         stage('Check the environment') {
             steps {
+                // FIRST, WHETHER THE INTERPRETER CAN BE REACHED AT ALL. It
+                // lives on a shared network drive, and when that share is
+                // unreachable cmd prints "The network path was not found" and
+                // the import check below then blames the packages - which
+                // were never looked at, because Python never started. The
+                // path is masked in the log, so this names the agent instead;
+                // the path itself is in the credential store.
+                bat '''if not exist "%PYTHON%" (echo. & echo The Python named by the wlw-notify-python credential cannot be reached from %NODE_NAME%, so Python never started and no package was checked. & echo If that path is on a network share, the share or its server is down or unreachable from this agent. Check the share, not the environment - nothing in this repository can fix it. & exit /b 1)'''
+
                 // This CHECKS the interpreter and never installs into it.
                 //
                 // The interpreter may be a managed environment shared with
