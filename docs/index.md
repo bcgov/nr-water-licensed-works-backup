@@ -36,6 +36,6 @@ wrong.
 
 ## Quick links
 
-- [What arrives in your inbox]({{ site.baseurl }}{% link user-guide/alerts.md %})
+- [What arrives by email]({{ site.baseurl }}{% link user-guide/alerts.md %})
 - [What to do when a message arrives]({{ site.baseurl }}{% link user-guide/what-to-do.md %})
 - [How it runs]({{ site.baseurl }}{% link developer-guide/how-it-runs.md %})

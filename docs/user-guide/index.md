@@ -8,8 +8,8 @@ has_children: true
 
 For the data owner and the GIS team. No technical background is needed.
 
-You and the Water Business shared inbox receive the same messages from this
-system. This guide is written for both.
+The data owner and the Water Business shared inbox receive the same
+messages from this system. This guide is written for both.
 
 ## What this protects
 
@@ -60,10 +60,10 @@ recognised as a drift rather than as an ordinary day.
 
 ## Pages in this guide
 
-1. [What arrives in your inbox]({{ site.baseurl }}{% link user-guide/alerts.md %}) —
+1. [What arrives by email]({{ site.baseurl }}{% link user-guide/alerts.md %}) —
    the kinds of messages this system sends, and what silence means.
 2. [What to do when a message arrives]({{ site.baseurl }}{% link user-guide/what-to-do.md %}) —
-   for each kind of message, what it means and whether it needs you.
+   for each kind of message, what it means and whether it needs action.
 3. [Requesting a restore]({{ site.baseurl }}{% link user-guide/requesting-a-restore.md %}) —
    how to ask for a layer to be put back, and what it costs.
 4. [What this does not cover]({{ site.baseurl }}{% link user-guide/limits.md %}) —

@@ -1,15 +1,15 @@
 ---
-title: What arrives in your inbox
+title: What arrives by email
 parent: User Guide
 nav_order: 1
 ---
 
-# What arrives in your inbox
+# What arrives by email
 
 **Everything below goes to the data owner and to the Water Business shared
 inbox.**
 
-## What reaches you
+## What reaches the data owner
 
 | | What it means |
 |---|---|
@@ -22,12 +22,12 @@ inbox.**
 
 | | Why |
 |---|---|
-| **A system failure** | Object storage timed out, or a sign-in failed. Nothing to do with your data. If it lasts more than a few days it reaches you too, because at that point backups have stopped running. |
+| **A system failure** | Object storage timed out, or a sign-in failed. Nothing to do with the data itself. If it lasts more than a few days it reaches the data owner too, because at that point backups have stopped running. |
 | **A job that did not run** | The pipeline itself has stopped. The maintainer's to fix. |
 | **Housekeeping** | Old copies not being cleaned up, or a monthly copy not being created. |
 
 See [What to do when a message arrives]({{ site.baseurl }}{% link user-guide/what-to-do.md %})
-for what each of these actually asks of you.
+for what action, if any, each of these calls for.
 
 ## Three things about the volume
 
@@ -39,12 +39,13 @@ system is alive.
 
 *An example weekly summary, for a quiet week with nothing overdue.*
 
-**A problem lasting a week is one email, not seven.** You are told when a
-situation starts and when it ends. It repeats only if the situation
-genuinely changes — a second bad record, or a different check failing.
+**A problem lasting a week is one email, not seven.** The data owner is
+told when a situation starts and when it ends. It repeats only if the
+situation genuinely changes — a second bad record, or a different check
+failing.
 
 **An alert that says a job did not run is about the pipeline, not about
-your data.** Those go to the maintainer, not to you.
+the data.** Those go to the maintainer only.
 
-If any of this would be noise in your inbox, say so — routing who gets told
-about what is a small configuration change, not a rebuild.
+If any of this turns out to be noise, say so — routing who gets told about
+what is a small configuration change, not a rebuild.
